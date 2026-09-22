@@ -1,0 +1,32 @@
+{
+  "manifest_version": 3,
+  "name": "Agent Noise Cancellation",
+  "description": "TX-side DTLN noise cancellation for the agent's outgoing microphone on browser calls.",
+  "version": "0.1.3",
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Agent Noise Cancellation"
+  },
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "permissions": ["activeTab", "scripting", "storage", "audioCapture", "microphone", "tabs"],
+  "host_permissions": ["<all_urls>"],
+  "content_security_policy": {
+    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self';"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content-script.js"],
+      "run_at": "document_start"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["page-bridge.js", "dtln/*", "assets/*"],
+      "matches": ["<all_urls>"]
+    }
+  ]
+}

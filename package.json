@@ -1,0 +1,21 @@
+{
+  "name": "noise-cancel-extension",
+  "private": true,
+  "version": "0.1.3",
+  "type": "module",
+  "scripts": {
+    "copy-dtln": "node scripts/copy-dtln-assets.mjs",
+    "dev": "npm run copy-dtln && vite build --watch",
+    "build": "npm run copy-dtln && vite build",
+    "lint": "eslint .",
+    "format": "prettier --write ."
+  },
+  "dependencies": {
+    "@workadventure/noise-suppression": "^0.1.1",
+    "vite": "^8.3.0"
+  },
+  "devDependencies": {
+    "eslint": "^9.9.0",
+    "prettier": "^3.3.3"
+  }
+}
