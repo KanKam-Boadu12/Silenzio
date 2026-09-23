@@ -3,6 +3,7 @@ import {
   MessageType,
   PageCommand,
   PageMessageSource,
+  USER_ENABLED_STORAGE_KEY,
 } from '../shared/constants.js';
 
 function injectPageBridge() {
@@ -38,11 +39,16 @@ function postToPage(command) {
 
 injectPageBridge();
 postToPage({ command: PageCommand.INIT });
-postToPage({ command: PageCommand.ENABLE });
+
+chrome.storage.local.get(USER_ENABLED_STORAGE_KEY).then((stored) => {
+  const enabled = stored[USER_ENABLED_STORAGE_KEY] !== false;
+  postToPage({ command: enabled ? PageCommand.ENABLE : PageCommand.DISABLE });
+});
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message?.type === MessageType.ENABLE) {
     injectPageBridge();
+    chrome.storage.local.set({ [USER_ENABLED_STORAGE_KEY]: true });
     postToPage({
       command: PageCommand.ENABLE,
       deviceId: message.selectedDeviceId,
@@ -52,6 +58,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   }
 
   if (message?.type === MessageType.DISABLE) {
+    chrome.storage.local.set({ [USER_ENABLED_STORAGE_KEY]: false });
     postToPage({ command: PageCommand.DISABLE });
     sendResponse({ ok: true });
     return true;
@@ -96,8 +103,13 @@ window.addEventListener('message', (event) => {
     return;
   }
 
-  chrome.runtime.sendMessage({
-    type: MessageType.EVENT,
-    event: event.data.event,
-  });
+  chrome.runtime.sendMessage(
+    {
+      type: MessageType.EVENT,
+      event: event.data.event,
+    },
+    () => {
+      void chrome.runtime.lastError;
+    },
+  );
 });

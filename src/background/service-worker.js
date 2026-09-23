@@ -1,7 +1,13 @@
-import { LOG_PREFIX, MessageType, STORAGE_KEY } from '../shared/constants.js';
+import { LOG_PREFIX, MessageType, STORAGE_KEY, duplexStatus } from '../shared/constants.js';
 
 function updateBadge(state) {
   if (!chrome.action) {
+    return;
+  }
+
+  if (!state.enabled) {
+    chrome.action.setBadgeText({ text: 'OFF' });
+    chrome.action.setBadgeBackgroundColor({ color: '#6b7280' });
     return;
   }
 
@@ -26,6 +32,24 @@ function updateBadge(state) {
   chrome.action.setBadgeText({ text: '' });
 }
 
+function logDuplex(state, tabId) {
+  const you = state.txProcessing ? 'live' : state.txStatus;
+  const them = state.rxProcessing ? 'live' : state.rxStatus;
+  const duplex = state.duplex ?? duplexStatus(state);
+
+  console.info(LOG_PREFIX, `duplex: ${duplex}`, {
+    tabId,
+    you,
+    them,
+    enabled: state.enabled,
+    status: state.status,
+    txStatus: state.txStatus,
+    rxStatus: state.rxStatus,
+    txProcessing: state.txProcessing,
+    rxProcessing: state.rxProcessing,
+  });
+}
+
 const initialState = {
   enabled: true,
   txEnabled: true,
@@ -36,10 +60,13 @@ const initialState = {
   processing: false,
   txProcessing: false,
   rxProcessing: false,
+  duplex: 'starting',
   failure: null,
   selectedDeviceId: '',
   devices: [],
 };
+
+let lastDuplexKey = '';
 
 chrome.runtime.onInstalled.addListener(() => {
   chrome.storage.session.set({ [STORAGE_KEY]: initialState });
@@ -66,8 +93,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     console.info(LOG_PREFIX, incoming.message ?? 'event', {
       tabId,
       status: incoming.status,
+      duplex: incoming.duplex,
       txStatus: incoming.txStatus,
       rxStatus: incoming.rxStatus,
+      txProcessing: incoming.txProcessing,
+      rxProcessing: incoming.rxProcessing,
       processing: incoming.processing,
       detail: incoming.detail,
     });
@@ -88,8 +118,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       processing: incoming.processing ?? current.processing,
       txProcessing: incoming.txProcessing ?? current.txProcessing,
       rxProcessing: incoming.rxProcessing ?? current.rxProcessing,
-      failure: incoming.failure ?? current.failure,
+      failure: Object.hasOwn(incoming, 'failure') ? incoming.failure : current.failure,
     };
+    updated.duplex = incoming.duplex ?? duplexStatus(updated);
+
+    const duplexKey = `${tabId}:${updated.duplex}:${updated.txProcessing}:${updated.rxProcessing}:${updated.txStatus}:${updated.rxStatus}`;
+    if (duplexKey !== lastDuplexKey) {
+      lastDuplexKey = duplexKey;
+      logDuplex(updated, tabId);
+    }
 
     chrome.storage.session.set({ [STORAGE_KEY]: updated });
     updateBadge(updated);

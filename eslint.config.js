@@ -2,7 +2,7 @@ import js from '@eslint/js';
 
 export default [
   {
-    ignores: ['dist/**', 'node_modules/**', 'public/dtln/**'],
+    ignores: ['dist/**', 'node_modules/**', 'public/dtln/**', 'public/engine/**', 'src/audio/rnnoise-worklet.js'],
   },
   js.configs.recommended,
   {
@@ -29,6 +29,7 @@ export default [
         setTimeout: 'readonly',
         clearTimeout: 'readonly',
         window: 'readonly',
+        Buffer: 'readonly',
       },
     },
     rules: {

@@ -1,10 +1,11 @@
-import { AudioPipeline, DEFAULT_MIC_CONSTRAINTS, DTLN_LAYER_COUNT } from '../audio/audio-pipeline.js';
+import { AudioPipeline, mergeCallAudioConstraints } from '../audio/audio-pipeline.js';
 import {
   LOG_PREFIX,
   PageCommand,
   PageMessageSource,
   WINDOW_BRIDGE_FLAG,
   WINDOW_STATE_KEY,
+  duplexStatus,
 } from '../shared/constants.js';
 
 if (window[WINDOW_BRIDGE_FLAG]) {
@@ -24,6 +25,7 @@ if (window[WINDOW_BRIDGE_FLAG]) {
         processing: window[WINDOW_STATE_KEY]?.processing ?? false,
         txProcessing: window[WINDOW_STATE_KEY]?.txProcessing ?? false,
         rxProcessing: window[WINDOW_STATE_KEY]?.rxProcessing ?? false,
+        duplex: duplexStatus(window[WINDOW_STATE_KEY] ?? {}),
         failure: window[WINDOW_STATE_KEY]?.failure ?? null,
         timestamp: Date.now(),
       },
@@ -37,12 +39,12 @@ if (window[WINDOW_BRIDGE_FLAG]) {
   const FROM_PAGE = PageMessageSource.PAGE;
 
   const state = {
-    enabled: true,
+    enabled: false,
     txEnabled: true,
     rxEnabled: true,
     selectedDeviceId: '',
     devices: [],
-    assetBaseUrl: '/',
+    assetBaseUrl: new URL('./', import.meta.url).href,
     installed: false,
     status: 'idle',
     txStatus: 'idle',
@@ -55,9 +57,10 @@ if (window[WINDOW_BRIDGE_FLAG]) {
   };
   window[WINDOW_STATE_KEY] = state;
 
-  const originals = {
+    const originals = {
     getUserMedia: navigator.mediaDevices?.getUserMedia?.bind(navigator.mediaDevices),
     RTCPeerConnection: window.RTCPeerConnection,
+    replaceTrack: null,
     mediaElementSrcObject: Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'srcObject'),
   };
 
@@ -77,7 +80,6 @@ if (window[WINDOW_BRIDGE_FLAG]) {
     return new AudioPipeline({
       assetBaseUrl: state.assetBaseUrl,
       direction,
-      layers: DTLN_LAYER_COUNT,
       onEvent: (event) => {
         if (direction === 'outgoing') {
           if (event.status) {
@@ -146,12 +148,18 @@ if (window[WINDOW_BRIDGE_FLAG]) {
       processing: state.processing,
       txProcessing: state.txProcessing,
       rxProcessing: state.rxProcessing,
+      duplex: duplexStatus(state),
       failure: state.failure,
       timestamp: Date.now(),
     };
 
     state.events = [event, ...state.events].slice(0, 15);
-    console.info(LOG_PREFIX, message, detail);
+    console.info(LOG_PREFIX, message, {
+      duplex: event.duplex,
+      you: state.txProcessing ? 'live' : state.txStatus,
+      them: state.rxProcessing ? 'live' : state.rxStatus,
+      ...detail,
+    });
     window.postMessage({ source: FROM_PAGE, event }, window.location.origin);
   }
 
@@ -203,19 +211,11 @@ if (window[WINDOW_BRIDGE_FLAG]) {
       return constraints;
     }
 
-    const requestedAudio = typeof constraints.audio === 'object' ? constraints.audio : {};
-    const nextAudio = {
-      ...requestedAudio,
-      ...DEFAULT_MIC_CONSTRAINTS,
-    };
-
-    if (state.selectedDeviceId) {
-      nextAudio.deviceId = { exact: state.selectedDeviceId };
-    }
+    const nextAudio = mergeCallAudioConstraints(constraints.audio, state.selectedDeviceId);
 
     return {
       ...constraints,
-      audio: nextAudio,
+      audio: Object.keys(nextAudio).length > 0 ? nextAudio : true,
     };
   }
 
@@ -233,35 +233,36 @@ if (window[WINDOW_BRIDGE_FLAG]) {
 
     const ready = await ensureEnabled();
     if (!ready || !state.txEnabled || state.txStatus !== 'active') {
-      console.error(`${LOG_PREFIX} returning raw microphone — TX noise cancellation INACTIVE`, state.failure);
-      publish('outgoing: raw mic returned because DTLN TX is inactive', {
-        pipeline: 'outgoing',
-        type: 'inactive-passthrough',
-        reason: state.failure,
-      });
       return rawStream;
     }
 
     try {
       const processed = await txPipeline.processOutgoingStream(rawStream);
-      const videoTracks = rawStream.getVideoTracks();
-      if (processed.cleanTrack) {
-        processedTracks.add(processed.cleanTrack);
-        localMicTracks.add(processed.cleanTrack);
-        trackPairMap.set(processed.cleanTrack, processed.rawTrack);
+      const started = await processed.processingStarted;
+      if (!started || !processed.cleanTrack) {
+        processed.dispose();
+        publish('outgoing: engine did not start processing; returning raw microphone', {
+          pipeline: 'outgoing',
+          type: 'inactive-passthrough',
+        });
+        return rawStream;
       }
-      publish('outgoing: returned DTLN-denoised microphone stream', {
+
+      processedTracks.add(processed.cleanTrack);
+      localMicTracks.add(processed.cleanTrack);
+      trackPairMap.set(processed.cleanTrack, processed.rawTrack);
+      publish('outgoing: returned DeepFilterNet3 + RNNoise microphone stream', {
         pipeline: 'outgoing',
         type: 'stream-replaced',
         settings: processed.settings,
       });
-      return new MediaStream([processed.cleanTrack, ...videoTracks].filter(Boolean));
+      return new MediaStream([processed.cleanTrack, ...rawStream.getVideoTracks()].filter(Boolean));
     } catch (error) {
       state.txStatus = 'inactive';
       state.txProcessing = false;
       state.failure = error.message;
       updateOverallStatus();
-      console.error(`${LOG_PREFIX} DTLN TX failed during getUserMedia — INACTIVE`, error);
+      console.error(`${LOG_PREFIX} TX engine failed during getUserMedia — INACTIVE`, error);
       publish(`outgoing: ${error.message}`, {
         pipeline: 'outgoing',
         type: 'error',
@@ -278,6 +279,16 @@ if (window[WINDOW_BRIDGE_FLAG]) {
 
     capturedRawTracks.add(track);
     const processed = await txPipeline.processOutgoingStream(new MediaStream([track]));
+    const started = await processed.processingStarted;
+    if (!started) {
+      processed.dispose();
+      publish('outgoing: engine did not start processing; sending raw microphone', {
+        pipeline: 'outgoing',
+        type: 'inactive-passthrough',
+      });
+      return track;
+    }
+
     processedTracks.add(processed.cleanTrack);
     localMicTracks.add(processed.cleanTrack);
     trackPairMap.set(processed.cleanTrack, track);
@@ -308,7 +319,7 @@ if (window[WINDOW_BRIDGE_FLAG]) {
         return sender;
       }
 
-      senderToRawTrackMap.set(sender, track);
+      senderToRawTrackMap.set(sender, trackPairMap.get(track) || track);
       ensureEnabled()
         .then((ready) => {
           if (!ready || !state.txEnabled || state.txStatus !== 'active') {
@@ -316,7 +327,9 @@ if (window[WINDOW_BRIDGE_FLAG]) {
           }
           return denoiseOutgoingTrack(track).then((cleanTrack) => {
             if (cleanTrack && cleanTrack !== track) {
-              return sender.replaceTrack(cleanTrack);
+              return originals.replaceTrack
+                ? originals.replaceTrack.call(sender, cleanTrack)
+                : sender.replaceTrack(cleanTrack);
             }
             return undefined;
           });
@@ -356,13 +369,21 @@ if (window[WINDOW_BRIDGE_FLAG]) {
         }
 
         try {
-          if (!senderToRawTrackMap.has(sender)) {
-            const raw = trackPairMap.get(sender.track) || sender.track;
-            senderToRawTrackMap.set(sender, raw);
+          const rawTrack = senderToRawTrackMap.get(sender) || trackPairMap.get(sender.track) || sender.track;
+          if (sender.track?.readyState === 'live' && txPipeline.graphs.has(sender.track.id)) {
+            continue;
           }
-          const cleanTrack = await denoiseOutgoingTrack(sender.track);
+          if (!rawTrack || rawTrack.readyState !== 'live') {
+            continue;
+          }
+          senderToRawTrackMap.set(sender, rawTrack);
+          const cleanTrack = await denoiseOutgoingTrack(rawTrack);
           if (cleanTrack && cleanTrack !== sender.track) {
-            await sender.replaceTrack(cleanTrack);
+            if (originals.replaceTrack) {
+              await originals.replaceTrack.call(sender, cleanTrack);
+            } else {
+              await sender.replaceTrack(cleanTrack);
+            }
             publish('outgoing: replaced existing sender track', {
               pipeline: 'outgoing',
               type: 'replace-track',
@@ -390,7 +411,11 @@ if (window[WINDOW_BRIDGE_FLAG]) {
         const rawTrack = senderToRawTrackMap.get(sender);
         if (rawTrack && rawTrack.readyState === 'live' && sender.track !== rawTrack) {
           try {
-            await sender.replaceTrack(rawTrack);
+            if (originals.replaceTrack) {
+              await originals.replaceTrack.call(sender, rawTrack);
+            } else {
+              await sender.replaceTrack(rawTrack);
+            }
             publish('outgoing: restored raw microphone track', {
               pipeline: 'outgoing',
               type: 'restore-raw-track',
@@ -403,7 +428,6 @@ if (window[WINDOW_BRIDGE_FLAG]) {
     }
   }
 
-  // --- INCOMING (RX) INTERCEPTION ---
   function isIncomingStream(stream) {
     if (!stream || !(stream instanceof MediaStream)) {
       return false;
@@ -412,8 +436,24 @@ if (window[WINDOW_BRIDGE_FLAG]) {
     if (audioTracks.length === 0) {
       return false;
     }
-    // Stream is incoming if none of its tracks belong to our local mic
-    return audioTracks.every((t) => !localMicTracks.has(t));
+    return audioTracks.every((track) => !localMicTracks.has(track) && !processedTracks.has(track));
+  }
+
+  function attachPlayback(element, stream) {
+    originals.mediaElementSrcObject.set.call(element, stream);
+    if (typeof element.play === 'function') {
+      element.play()?.catch?.(() => {});
+    }
+  }
+
+  function disposeMediaEntry(entry) {
+    if (!entry) {
+      return;
+    }
+    entry.setBypass?.(true);
+    entry.dispose = null;
+    entry.graphKey = null;
+    entry.setBypass = null;
   }
 
   function patchMediaElementSrcObject() {
@@ -431,7 +471,9 @@ if (window[WINDOW_BRIDGE_FLAG]) {
         return originals.mediaElementSrcObject.get.call(this);
       },
       set(stream) {
+        const previous = activeMediaElements.get(this);
         if (!isIncomingStream(stream)) {
+          disposeMediaEntry(previous);
           activeMediaElements.delete(this);
           originals.mediaElementSrcObject.set.call(this, stream);
           return;
@@ -439,40 +481,67 @@ if (window[WINDOW_BRIDGE_FLAG]) {
 
         const rawStream = stream;
         const element = this;
-        activeMediaElements.set(element, { rawStream, cleanStream: null });
+        disposeMediaEntry(previous);
+        activeMediaElements.set(element, {
+          rawStream,
+          graphKey: null,
+          dispose: null,
+          setBypass: null,
+          processingPromise: null,
+        });
+
+        attachPlayback(element, rawStream);
 
         const isCurrentAssignment = () => activeMediaElements.get(element)?.rawStream === rawStream;
 
-        const attachRawPlayback = () => {
-          if (isCurrentAssignment()) {
-            originals.mediaElementSrcObject.set.call(element, rawStream);
-          }
-        };
-
         ensureEnabled()
           .then((ready) => {
-            if (!isCurrentAssignment()) {
+            if (!isCurrentAssignment() || !ready || !state.rxEnabled || state.rxStatus !== 'active') {
               return undefined;
             }
 
-            if (!ready || !state.rxEnabled || state.rxStatus !== 'active') {
-              attachRawPlayback();
-              return undefined;
+            const entry = activeMediaElements.get(element);
+            if (!entry || entry.processingPromise) {
+              return entry?.processingPromise;
             }
 
-            return rxPipeline.processInputStream(rawStream).then((processed) => {
-              if (!isCurrentAssignment()) {
-                return;
-              }
+            const processingPromise = rxPipeline
+              .processMediaElement(element)
+              .then(async (processed) => {
+                const started = await processed.processingStarted;
+                if (!isCurrentAssignment() || !state.enabled || !state.rxEnabled) {
+                  processed.setBypass?.(true);
+                  return;
+                }
 
-              activeMediaElements.set(element, { rawStream, cleanStream: processed.cleanStream });
-              originals.mediaElementSrcObject.set.call(element, processed.cleanStream);
-              publish('incoming: attached DTLN-denoised stream to media element');
-            });
+                if (!started) {
+                  processed.setBypass?.(true);
+                  console.warn(`${LOG_PREFIX} RX engine did not start processing; playing raw media element`);
+                  return;
+                }
+
+                Object.assign(entry, {
+                  graphKey: processed.graphKey,
+                  dispose: processed.dispose,
+                  setBypass: processed.setBypass,
+                });
+                publish('incoming: routed media element through DeepFilterNet3 + RNNoise');
+              })
+              .catch((error) => {
+                console.error(`${LOG_PREFIX} RX processing failed for media element`, error);
+              })
+              .finally(() => {
+                const current = activeMediaElements.get(element);
+                if (current?.processingPromise === processingPromise) {
+                  current.processingPromise = null;
+                }
+              });
+
+            entry.processingPromise = processingPromise;
+            return processingPromise;
           })
-          .catch((err) => {
-            console.error(`${LOG_PREFIX} RX processing failed for media element`, err);
-            attachRawPlayback();
+          .catch((error) => {
+            console.error(`${LOG_PREFIX} RX processing failed for media element`, error);
           });
       },
     });
@@ -483,26 +552,26 @@ if (window[WINDOW_BRIDGE_FLAG]) {
       return;
     }
 
-    for (const [element, { rawStream }] of activeMediaElements.entries()) {
-      if (rawStream && rawStream.active) {
-        try {
-          const processed = await rxPipeline.processInputStream(rawStream);
-          activeMediaElements.set(element, { rawStream, cleanStream: processed.cleanStream });
-          originals.mediaElementSrcObject.set.call(element, processed.cleanStream);
-          publish('incoming: attached DTLN-denoised stream to media element');
-        } catch (err) {
-          console.error(`${LOG_PREFIX} failed to denoise active media element`, err);
-        }
+    for (const [element, entry] of activeMediaElements.entries()) {
+      if (!entry?.rawStream?.active) {
+        continue;
       }
+      if (typeof entry.setBypass === 'function') {
+        entry.setBypass(false);
+        continue;
+      }
+      const setter = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'srcObject')?.set;
+      setter?.call(element, entry.rawStream);
     }
   }
 
   function restoreMediaElements() {
-    for (const [element, { rawStream }] of activeMediaElements.entries()) {
+    for (const [element, entry] of activeMediaElements.entries()) {
       try {
-        originals.mediaElementSrcObject.set.call(element, rawStream);
-      } catch (err) {
-        console.warn(`${LOG_PREFIX} failed to restore media element to raw stream`, err);
+        attachPlayback(element, entry.rawStream);
+        disposeMediaEntry(entry);
+      } catch (error) {
+        console.warn(`${LOG_PREFIX} failed to restore media element to raw stream`, error);
       }
     }
   }
@@ -516,13 +585,43 @@ if (window[WINDOW_BRIDGE_FLAG]) {
     PatchedRTCPeerConnection.prototype = originals.RTCPeerConnection.prototype;
     window.RTCPeerConnection = PatchedRTCPeerConnection;
     patchMediaElementSrcObject();
+
+    if (window.RTCRtpSender?.prototype?.replaceTrack && !originals.replaceTrack) {
+      originals.replaceTrack = window.RTCRtpSender.prototype.replaceTrack;
+      window.RTCRtpSender.prototype.replaceTrack = async function replaceTrack(track) {
+        if (
+          !state.enabled ||
+          !state.txEnabled ||
+          track?.kind !== 'audio' ||
+          processedTracks.has(track)
+        ) {
+          return originals.replaceTrack.call(this, track);
+        }
+
+        senderToRawTrackMap.set(this, trackPairMap.get(track) || track);
+        const cleanTrack = await denoiseOutgoingTrack(track);
+        return originals.replaceTrack.call(this, cleanTrack);
+      };
+    }
+
     state.installed = true;
+
+    const resumeContexts = () => {
+      txPipeline.context?.resume?.();
+      rxPipeline.context?.resume?.();
+    };
+    window.addEventListener('pointerdown', resumeContexts, true);
+    window.addEventListener('keydown', resumeContexts, true);
   }
 
   let enablePromise = null;
 
   async function ensureEnabled() {
-    if (state.enabled && state.status === 'active') {
+    if (!state.enabled) {
+      return false;
+    }
+
+    if (state.status === 'active') {
       return true;
     }
 
@@ -535,6 +634,11 @@ if (window[WINDOW_BRIDGE_FLAG]) {
   }
 
   async function enable() {
+    if (state.enabled && state.status === 'active') {
+      publish('extension: already active');
+      return;
+    }
+
     if (enablePromise) {
       return enablePromise;
     }
@@ -547,23 +651,16 @@ if (window[WINDOW_BRIDGE_FLAG]) {
       state.status = 'starting';
       state.txStatus = state.txEnabled ? 'starting' : 'idle';
       state.rxStatus = state.rxEnabled ? 'starting' : 'idle';
-      publish('extension: auto-starting DTLN layers');
+      publish('extension: auto-starting DeepFilterNet3 + Jitsi RNNoise at 48 kHz');
 
       try {
-        txPipeline.stop();
-        rxPipeline.stop();
-        txPipeline = createPipeline('outgoing');
-        rxPipeline = createPipeline('incoming');
-
-        const inits = [];
         if (state.txEnabled) {
-          inits.push(txPipeline.initialize());
+          txPipeline.stopGraphs();
+          await txPipeline.initialize();
         }
         if (state.rxEnabled) {
-          inits.push(rxPipeline.initialize());
+          await rxPipeline.initialize();
         }
-
-        await Promise.all(inits);
 
         if (state.txEnabled) {
           state.txStatus = 'active';
@@ -573,11 +670,10 @@ if (window[WINDOW_BRIDGE_FLAG]) {
         }
         updateOverallStatus();
 
-        publish(`extension: DTLN active with ${DTLN_LAYER_COUNT} layers`);
+        publish('extension: DeepFilterNet3 + Jitsi RNNoise active at 48 kHz');
         await replaceExistingSenders();
         await denoiseActiveMediaElements();
       } catch (error) {
-        enablePromise = null;
         state.status = 'inactive';
         state.processing = false;
         state.failure = error.message;
@@ -586,6 +682,8 @@ if (window[WINDOW_BRIDGE_FLAG]) {
           type: 'error',
           reason: error.message,
         });
+      } finally {
+        enablePromise = null;
       }
     })();
 
@@ -678,13 +776,17 @@ if (window[WINDOW_BRIDGE_FLAG]) {
       throw new Error('Selected microphone produced no audio track');
     }
 
+    const rawOutgoing = outgoingTrack;
     if (state.enabled && state.txEnabled && state.txStatus === 'active') {
       const processed = await txPipeline.processOutgoingStream(rawStream);
-      if (processed.cleanTrack) {
+      const started = await processed.processingStarted;
+      if (started && processed.cleanTrack) {
         processedTracks.add(processed.cleanTrack);
         localMicTracks.add(processed.cleanTrack);
-        trackPairMap.set(processed.cleanTrack, processed.rawTrack);
+        trackPairMap.set(processed.cleanTrack, rawOutgoing);
         outgoingTrack = processed.cleanTrack;
+      } else {
+        processed.dispose();
       }
     }
 
@@ -694,8 +796,12 @@ if (window[WINDOW_BRIDGE_FLAG]) {
           continue;
         }
 
-        senderToRawTrackMap.set(sender, rawStream.getAudioTracks()[0]);
-        await sender.replaceTrack(outgoingTrack);
+        senderToRawTrackMap.set(sender, rawOutgoing);
+        if (originals.replaceTrack) {
+          await originals.replaceTrack.call(sender, outgoingTrack);
+        } else {
+          await sender.replaceTrack(outgoingTrack);
+        }
       }
     }
   }
@@ -753,6 +859,8 @@ if (window[WINDOW_BRIDGE_FLAG]) {
 
     if (event.data.extensionBaseUrl) {
       state.assetBaseUrl = event.data.extensionBaseUrl;
+      txPipeline.assetBaseUrl = state.assetBaseUrl;
+      rxPipeline.assetBaseUrl = state.assetBaseUrl;
     }
 
     if (event.data.command === PageCommand.INIT) {
@@ -801,5 +909,4 @@ if (window[WINDOW_BRIDGE_FLAG]) {
   installPatches();
   refreshAvailableDevices();
   publish('extension: bridge installed');
-  enable();
 }

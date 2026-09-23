@@ -104,3 +104,16 @@ body {
   border-color: #93c5fd;
   outline: none;
 }
+
+.popup__switch {
+  align-items: center;
+  display: flex;
+  font-size: 0.92rem;
+  font-weight: 600;
+  gap: 10px;
+}
+
+.popup__switch input {
+  height: 18px;
+  width: 18px;
+}

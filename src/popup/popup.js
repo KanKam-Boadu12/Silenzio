@@ -1,84 +1,145 @@
 import '../popup/popup.css';
-import { LOG_PREFIX, MessageType, STORAGE_KEY } from '../shared/constants.js';
+import { LOG_PREFIX, MessageType, STORAGE_KEY, USER_ENABLED_STORAGE_KEY } from '../shared/constants.js';
 
-const STATUS_LABEL = {
-  idle: 'Starting…',
-  starting: 'Starting…',
-  active: 'Active',
-  inactive: 'Inactive',
-  failed: 'Inactive',
-};
+function isConnectionError(error) {
+  const message = String(error?.message ?? error ?? '');
+  return (
+    message.includes('Receiving end does not exist') ||
+    message.includes('Could not establish connection')
+  );
+}
+
+function statusLabel(state) {
+  if (state.connectionError) {
+    return { text: 'No call tab', kind: 'inactive' };
+  }
+  if (!state.enabled) {
+    return { text: 'Off', kind: 'idle' };
+  }
+  if (state.status === 'inactive' || state.status === 'failed' || state.failure) {
+    return { text: 'Error', kind: 'inactive' };
+  }
+  if (state.status === 'active') {
+    return { text: 'On', kind: 'active' };
+  }
+  return { text: 'Starting…', kind: 'starting' };
+}
 
 export function createPopup(root) {
   let state = {
-    status: 'starting',
-    enabled: true,
+    status: 'idle',
+    enabled: false,
     selectedDeviceId: '',
     devices: [],
     failure: null,
+    connectionError: null,
+    txProcessing: false,
+    rxProcessing: false,
+    txStatus: 'idle',
+    rxStatus: 'idle',
   };
+  let pollTimer = 0;
 
   async function getActiveTab() {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
     return tab;
   }
 
-  async function sendToActiveTab(type, payload = {}) {
-    const tab = await getActiveTab();
-
-    if (!tab?.id) {
-      throw new Error('No active tab found');
-    }
-
-    assertSupportedTab(tab);
-    await injectPageBridge(tab.id);
-
-    try {
-      return await chrome.tabs.sendMessage(tab.id, { type, ...payload });
-    } catch (_error) {
-      await injectContentScript(tab.id);
-      return chrome.tabs.sendMessage(tab.id, { type, ...payload });
-    }
+  async function sendToTab(tabId, type, payload = {}) {
+    return chrome.tabs.sendMessage(tabId, { type, ...payload });
   }
 
   async function injectContentScript(tabId) {
     await chrome.scripting.executeScript({
       target: { tabId },
       files: ['content-script.js'],
+      injectImmediately: true,
     });
   }
 
-  async function injectPageBridge(tabId) {
-    try {
-      await chrome.scripting.executeScript({
-        target: { tabId },
-        files: ['page-bridge.js'],
-        world: 'MAIN',
-      });
-    } catch (_error) {
-      // Already injected or blocked by the page
+  async function sendToActiveTab(type, payload = {}) {
+    const tab = await getActiveTab();
+
+    if (!tab?.id) {
+      throw new Error('Open a call tab to use noise cancellation.');
     }
+
+    assertSupportedTab(tab);
+
+    try {
+      return await sendToTab(tab.id, type, payload);
+    } catch (error) {
+      await injectContentScript(tab.id);
+      await new Promise((resolve) => {
+        window.setTimeout(resolve, 75);
+      });
+      try {
+        return await sendToTab(tab.id, type, payload);
+      } catch (retryError) {
+        throw isConnectionError(retryError)
+          ? new Error('Reload this call tab after updating the extension, then open the popup again.')
+          : retryError;
+      }
+    }
+  }
+
+  function applyStored(stored = {}) {
+    state = {
+      ...state,
+      enabled: stored.enabled ?? state.enabled,
+      selectedDeviceId: stored.selectedDeviceId ?? state.selectedDeviceId,
+      devices: Array.isArray(stored.devices) ? stored.devices : state.devices,
+      status: stored.status ?? state.status,
+      failure: Object.hasOwn(stored, 'failure') ? stored.failure : state.failure,
+      txProcessing: stored.txProcessing ?? state.txProcessing,
+      rxProcessing: stored.rxProcessing ?? state.rxProcessing,
+      txStatus: stored.txStatus ?? state.txStatus,
+      rxStatus: stored.rxStatus ?? state.rxStatus,
+    };
   }
 
   async function refresh() {
     const storedState = await chrome.storage.session.get(STORAGE_KEY);
-    const stored = storedState[STORAGE_KEY] ?? {};
-
-    state = {
-      ...state,
-      enabled: stored.enabled ?? true,
-      selectedDeviceId: stored.selectedDeviceId ?? state.selectedDeviceId,
-      devices: Array.isArray(stored.devices) ? stored.devices : state.devices,
-      status: stored.status ?? state.status,
-      failure: stored.failure ?? state.failure,
-    };
+    applyStored(storedState[STORAGE_KEY] ?? {});
 
     try {
-      await sendToActiveTab(MessageType.ENABLE, { selectedDeviceId: state.selectedDeviceId });
+      await sendToActiveTab(MessageType.GET_STATUS);
       await sendToActiveTab(MessageType.GET_INPUT_DEVICES);
+      state = { ...state, connectionError: null };
     } catch (error) {
       console.warn(LOG_PREFIX, error.message);
-      state = { ...state, status: 'inactive', failure: error.message };
+      state = {
+        ...state,
+        connectionError: error.message,
+      };
+    }
+
+    render();
+  }
+
+  async function toggleEnabled() {
+    const nextEnabled = !state.enabled;
+    state = {
+      ...state,
+      enabled: nextEnabled,
+      status: nextEnabled ? 'starting' : 'idle',
+      failure: null,
+      connectionError: null,
+    };
+    render();
+
+    try {
+      await chrome.storage.local.set({ [USER_ENABLED_STORAGE_KEY]: nextEnabled });
+      if (nextEnabled) {
+        await sendToActiveTab(MessageType.ENABLE, { selectedDeviceId: state.selectedDeviceId });
+      } else {
+        await sendToActiveTab(MessageType.DISABLE);
+      }
+      await sendToActiveTab(MessageType.GET_STATUS);
+      state = { ...state, connectionError: null };
+    } catch (error) {
+      console.warn(LOG_PREFIX, error.message);
+      state = { ...state, connectionError: error.message };
     }
 
     render();
@@ -92,6 +153,8 @@ export function createPopup(root) {
       await sendToActiveTab(MessageType.SELECT_INPUT_DEVICE, { deviceId });
     } catch (error) {
       console.warn(LOG_PREFIX, error.message);
+      state = { ...state, connectionError: error.message };
+      render();
     }
   }
 
@@ -105,7 +168,7 @@ export function createPopup(root) {
   }
 
   function render() {
-    const isLive = state.status === 'active';
+    const status = statusLabel(state);
     const devices = Array.isArray(state.devices) ? state.devices.filter((device) => device?.deviceId) : [];
     const deviceOptions = [
       `<option value="" ${!state.selectedDeviceId ? 'selected' : ''}>default</option>`,
@@ -114,17 +177,23 @@ export function createPopup(root) {
         return `<option value="${escapeHtml(device.deviceId)}" ${isSelected ? 'selected' : ''}>${escapeHtml(device.label || 'Microphone')}</option>`;
       }),
     ].join('');
+    const alertMessage = state.connectionError || state.failure;
 
     root.innerHTML = `
       <section class="popup">
         <header class="popup__header">
           <h1 class="popup__title">Noise cancellation</h1>
-          <span class="popup__status popup__status--${isLive ? 'active' : state.status}">${STATUS_LABEL[state.status] ?? STATUS_LABEL.idle}</span>
+          <span class="popup__status popup__status--${status.kind}">${status.text}</span>
         </header>
 
+        <label class="popup__switch">
+          <input type="checkbox" data-enabled-toggle ${state.enabled ? 'checked' : ''} />
+          <span>${state.enabled ? 'On' : 'Off'}</span>
+        </label>
+
         ${
-          state.failure && state.status === 'inactive'
-            ? `<p class="popup__alert" role="alert">${escapeHtml(state.failure)}</p>`
+          alertMessage
+            ? `<p class="popup__alert" role="alert">${escapeHtml(alertMessage)}</p>`
             : ''
         }
 
@@ -137,6 +206,9 @@ export function createPopup(root) {
       </section>
     `;
 
+    root.querySelector('[data-enabled-toggle]')?.addEventListener('change', () => {
+      toggleEnabled();
+    });
     root.querySelector('[data-microphone-select]')?.addEventListener('change', (event) => {
       selectInputDevice(event.target.value ?? '');
     });
@@ -153,19 +225,19 @@ export function createPopup(root) {
       return;
     }
 
-    state = {
-      ...state,
-      enabled: next.enabled ?? state.enabled,
-      selectedDeviceId: next.selectedDeviceId ?? state.selectedDeviceId,
-      devices: Array.isArray(next.devices) ? next.devices : state.devices,
-      status: next.status ?? state.status,
-      failure: next.failure ?? state.failure,
-    };
+    applyStored(next);
     render();
   });
 
   render();
   refresh();
+  pollTimer = window.setInterval(() => {
+    refresh();
+  }, 1500);
+
+  window.addEventListener('unload', () => {
+    window.clearInterval(pollTimer);
+  });
 }
 
 function escapeHtml(value) {
