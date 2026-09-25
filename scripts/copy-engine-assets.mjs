@@ -23,6 +23,19 @@ if (!match) {
 
 let worklet = JSON.parse(match[1]);
 worklet = worklet.replace(
+  `if (typeof TextDecoder === 'undefined') {`,
+  `if (!globalThis.crypto?.getRandomValues) {
+        const cryptoRandom = (array) => {
+            for (let i = 0; i < array.length; i += 1) {
+                array[i] = Math.floor(Math.random() * 256);
+            }
+            return array;
+        };
+        globalThis.crypto = { getRandomValues: cryptoRandom };
+    }
+    if (typeof TextDecoder === 'undefined') {`,
+);
+worklet = worklet.replace(
   'this.isInitialized = true;\n                this.port.onmessage = (event) => {',
   `this.isInitialized = true;
                 this.port.postMessage({ type: 'ready' });
@@ -35,6 +48,11 @@ worklet = worklet.replace(
                     this.processingStartedReported = true;
                     this.port.postMessage({ type: 'processing-started', processedQuanta: 1 });
                 }`,
+);
+worklet = worklet.replace(
+  `console.error('Failed to initialize DeepFilter in AudioWorklet:', error);`,
+  `console.error('Failed to initialize DeepFilter in AudioWorklet:', error);
+                this.port.postMessage({ type: 'error', message: String(error && error.message || error) });`,
 );
 
 await writeFile(join(dest, 'dfn-processor.js'), worklet);

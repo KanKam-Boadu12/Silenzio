@@ -4,10 +4,13 @@ import { LOG_PREFIX } from '../shared/constants.js';
 export const DEFAULT_MIC_CONSTRAINTS = {};
 export const ENGINE_SAMPLE_RATE_HZ = ENGINE_SAMPLE_RATE;
 
-export function mergeCallAudioConstraints(audioConstraints, selectedDeviceId = '') {
+export function mergeCallAudioConstraints(audioConstraints, selectedDeviceId = '', echoCancellation = true) {
   const requested =
     typeof audioConstraints === 'object' && audioConstraints !== null ? { ...audioConstraints } : {};
 
+  if (echoCancellation) {
+    requested.echoCancellation = true;
+  }
   requested.noiseSuppression = false;
   requested.autoGainControl = false;
 
@@ -78,6 +81,16 @@ export class AudioPipeline {
 
     if (this.context.state === 'suspended') {
       await this.context.resume();
+    }
+
+    if (!this.silentKeepAlive) {
+      const gain = this.context.createGain();
+      gain.gain.value = 0;
+      const silent = this.context.createConstantSource();
+      silent.connect(gain);
+      gain.connect(this.context.destination);
+      silent.start();
+      this.silentKeepAlive = { gain, silent };
     }
 
     return this.context;
@@ -241,10 +254,8 @@ export class AudioPipeline {
     const chain = await this.createProcessorChain(context);
     const source = context.createMediaStreamSource(graphStream);
     const destination = context.createMediaStreamDestination();
-    const keepAlive = context.createGain();
-    keepAlive.gain.value = 0;
 
-    this.wireGraph(source, chain.highpass, chain.processors, destination, { keepAlive });
+    this.wireGraph(source, chain.highpass, chain.processors, destination);
 
     const cleanTrack = destination.stream.getAudioTracks()[0];
 
@@ -266,7 +277,6 @@ export class AudioPipeline {
       processors: chain.processors,
       highpass: chain.highpass,
       destination,
-      keepAlive,
       clonedTracks,
       processingTimer: chain.processingTimer,
       settleProcessingStarted: chain.settleProcessingStarted,

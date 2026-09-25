@@ -36,11 +36,32 @@ test('mergeCallAudioConstraints turns off browser NS/AGC so the 48 kHz engine ow
   assert.deepEqual(merged.deviceId, { exact: 'mic-1' });
 });
 
-test('mergeCallAudioConstraints treats boolean audio as engine-owned NS/AGC', () => {
+test('mergeCallAudioConstraints turns echo cancellation on with the extension', () => {
   assert.deepEqual(mergeCallAudioConstraints(true), {
+    echoCancellation: true,
     noiseSuppression: false,
     autoGainControl: false,
   });
+
+  const disabledByPage = mergeCallAudioConstraints({
+    echoCancellation: false,
+    noiseSuppression: true,
+    autoGainControl: true,
+  });
+  assert.equal(disabledByPage.echoCancellation, true);
+  assert.equal(disabledByPage.noiseSuppression, false);
+  assert.equal(disabledByPage.autoGainControl, false);
+});
+
+test('mergeCallAudioConstraints leaves echo cancellation unchanged when the extension is off', () => {
+  assert.deepEqual(mergeCallAudioConstraints(true, '', false), {
+    noiseSuppression: false,
+    autoGainControl: false,
+  });
+  assert.equal(
+    mergeCallAudioConstraints({ echoCancellation: false }, '', false).echoCancellation,
+    false,
+  );
 });
 
 test('createLiveAudioContext creates a 48 kHz interactive context when AudioContext exists', () => {

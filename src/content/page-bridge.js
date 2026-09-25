@@ -72,6 +72,7 @@ if (window[WINDOW_BRIDGE_FLAG]) {
   const trackPairMap = new WeakMap();
   const activeMediaElements = new Map();
   const capturedRawTracks = new Set();
+  const echoCancellationBefore = new WeakMap();
 
   let txPipeline = createPipeline('outgoing');
   let rxPipeline = createPipeline('incoming');
@@ -206,12 +207,81 @@ if (window[WINDOW_BRIDGE_FLAG]) {
     return state.devices;
   }
 
+  function rememberEchoCancellation(track, previous) {
+    if (!track || echoCancellationBefore.has(track)) {
+      return;
+    }
+    echoCancellationBefore.set(track, previous);
+  }
+
+  async function enableEchoCancellation(track, previous) {
+    if (track?.kind !== 'audio' || typeof track.applyConstraints !== 'function') {
+      return;
+    }
+
+    rememberEchoCancellation(
+      track,
+      previous !== undefined ? previous : track.getSettings?.().echoCancellation === true,
+    );
+
+    try {
+      await track.applyConstraints({
+        echoCancellation: true,
+        noiseSuppression: false,
+        autoGainControl: false,
+      });
+    } catch (_error) {
+      // Some devices cannot change echo cancellation after the track is open.
+    }
+  }
+
+  async function restoreEchoCancellation(track) {
+    if (!echoCancellationBefore.has(track) || typeof track?.applyConstraints !== 'function') {
+      return;
+    }
+
+    const previous = echoCancellationBefore.get(track);
+    echoCancellationBefore.delete(track);
+
+    try {
+      await track.applyConstraints({ echoCancellation: previous });
+    } catch (_error) {
+      // The track may already have ended.
+    }
+  }
+
+  async function restoreEchoCancellationOnLiveMics() {
+    const tracks = new Set(capturedRawTracks);
+    for (const pc of peerConnections) {
+      for (const sender of pc.getSenders()) {
+        if (sender.track?.kind !== 'audio') {
+          continue;
+        }
+        tracks.add(senderToRawTrackMap.get(sender) || sender.track);
+      }
+    }
+    await Promise.all([...tracks].map((track) => restoreEchoCancellation(track)));
+  }
+
+  async function enableEchoCancellationOnLiveMics() {
+    const tracks = new Set(capturedRawTracks);
+    for (const pc of peerConnections) {
+      for (const sender of pc.getSenders()) {
+        if (sender.track?.kind !== 'audio') {
+          continue;
+        }
+        tracks.add(senderToRawTrackMap.get(sender) || sender.track);
+      }
+    }
+    await Promise.all([...tracks].map((track) => enableEchoCancellation(track)));
+  }
+
   function cleanAudioConstraints(constraints) {
     if (!audioRequested(constraints)) {
       return constraints;
     }
 
-    const nextAudio = mergeCallAudioConstraints(constraints.audio, state.selectedDeviceId);
+    const nextAudio = mergeCallAudioConstraints(constraints.audio, state.selectedDeviceId, state.enabled);
 
     return {
       ...constraints,
@@ -221,7 +291,16 @@ if (window[WINDOW_BRIDGE_FLAG]) {
 
   // --- OUTGOING (TX) INTERCEPTION ---
   async function getCleanUserMedia(constraints) {
+    const pageEchoCancellation =
+      typeof constraints?.audio === 'object' && constraints.audio !== null
+        ? constraints.audio.echoCancellation === true
+        : false;
     const rawStream = await originals.getUserMedia(cleanAudioConstraints(constraints));
+    if (state.enabled) {
+      await Promise.all(
+        rawStream.getAudioTracks().map((track) => enableEchoCancellation(track, pageEchoCancellation)),
+      );
+    }
     rawStream.getAudioTracks().forEach((t) => {
       localMicTracks.add(t);
       capturedRawTracks.add(t);
@@ -654,6 +733,7 @@ if (window[WINDOW_BRIDGE_FLAG]) {
       publish('extension: auto-starting DeepFilterNet3 + Jitsi RNNoise at 48 kHz');
 
       try {
+        await enableEchoCancellationOnLiveMics();
         if (state.txEnabled) {
           txPipeline.stopGraphs();
           await txPipeline.initialize();
@@ -701,6 +781,7 @@ if (window[WINDOW_BRIDGE_FLAG]) {
     state.failure = null;
 
     await restoreSenders();
+    await restoreEchoCancellationOnLiveMics();
     restoreMediaElements();
 
     txPipeline.stop();
@@ -766,6 +847,7 @@ if (window[WINDOW_BRIDGE_FLAG]) {
     }
 
     const rawStream = await originals.getUserMedia(cleanAudioConstraints({ audio: true }));
+    await Promise.all(rawStream.getAudioTracks().map((track) => enableEchoCancellation(track, false)));
     rawStream.getAudioTracks().forEach((track) => {
       localMicTracks.add(track);
       capturedRawTracks.add(track);

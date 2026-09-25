@@ -153,8 +153,6 @@ export async function selfCheckEngine(assetBaseUrl) {
     ),
   );
 
-  await Promise.all(nodes.map(({ ready }) => ready));
-
   const oscillator = context.createOscillator();
   oscillator.type = 'sine';
   oscillator.frequency.value = 440;
@@ -166,7 +164,12 @@ export async function selfCheckEngine(assetBaseUrl) {
   current.connect(context.destination);
   oscillator.start(0);
 
-  await Promise.all([started, context.startRendering()]);
+  const rendering = context.startRendering();
+  await Promise.all([
+    ...nodes.map(({ ready }) => ready),
+    started,
+    rendering,
+  ]);
   nodes.forEach(({ node }) => {
     node.port.postMessage({ type: 'dispose' });
     node.disconnect();

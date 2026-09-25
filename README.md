@@ -27,7 +27,7 @@ If the DTLN models or LiteRT runtime are missing, fail to load, or never process
 | Frame size | **512 samples** (32 ms) |
 | Worklet quantum | 128 samples (buffered ×4) |
 
-- **TX**: `getUserMedia` requests `echoCancellation`, `noiseSuppression`, and `autoGainControl` all **false** so the browser suppressor is not stacked with DTLN. Noise suppression sits **before** the Opus encoder (`RTCPeerConnection` `addTrack` / `replaceTrack`).
+- **TX**: turning the extension on requests browser `echoCancellation` and turns `noiseSuppression` and `autoGainControl` **off**. Turning it off restores the microphone's previous echo-cancellation setting and the original audio. The processed microphone is sent to the call and is not played back through the speakers. Noise suppression sits **before** the Opus encoder (`RTCPeerConnection` `addTrack` / `replaceTrack`).
 - **RX**: Incoming streams attached to `HTMLMediaElement.prototype.srcObject` (<audio> / <video>) are intercepted, routed through the RX DTLN pipeline, and rendered clean to the output device.
 
 ## Dual Controls & Live A/B Testing

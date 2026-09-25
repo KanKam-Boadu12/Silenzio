@@ -104,7 +104,6 @@ export function createPopup(root) {
 
     try {
       await sendToActiveTab(MessageType.GET_STATUS);
-      await sendToActiveTab(MessageType.GET_INPUT_DEVICES);
       state = { ...state, connectionError: null };
     } catch (error) {
       console.warn(LOG_PREFIX, error.message);
@@ -145,19 +144,6 @@ export function createPopup(root) {
     render();
   }
 
-  async function selectInputDevice(deviceId) {
-    state = { ...state, selectedDeviceId: deviceId };
-    render();
-
-    try {
-      await sendToActiveTab(MessageType.SELECT_INPUT_DEVICE, { deviceId });
-    } catch (error) {
-      console.warn(LOG_PREFIX, error.message);
-      state = { ...state, connectionError: error.message };
-      render();
-    }
-  }
-
   function assertSupportedTab(tab) {
     const url = tab.url ?? '';
     const blockedSchemes = ['chrome://', 'edge://', 'about:', 'devtools://', 'chrome-extension://'];
@@ -169,14 +155,6 @@ export function createPopup(root) {
 
   function render() {
     const status = statusLabel(state);
-    const devices = Array.isArray(state.devices) ? state.devices.filter((device) => device?.deviceId) : [];
-    const deviceOptions = [
-      `<option value="" ${!state.selectedDeviceId ? 'selected' : ''}>default</option>`,
-      ...devices.map((device) => {
-        const isSelected = device.deviceId === state.selectedDeviceId;
-        return `<option value="${escapeHtml(device.deviceId)}" ${isSelected ? 'selected' : ''}>${escapeHtml(device.label || 'Microphone')}</option>`;
-      }),
-    ].join('');
     const alertMessage = state.connectionError || state.failure;
 
     root.innerHTML = `
@@ -196,21 +174,11 @@ export function createPopup(root) {
             ? `<p class="popup__alert" role="alert">${escapeHtml(alertMessage)}</p>`
             : ''
         }
-
-        <section class="popup__panel" aria-label="Select microphone to denoise">
-          <label class="popup__label" for="microphone-select">Select microphone to denoise</label>
-          <select id="microphone-select" class="popup__select" data-microphone-select>
-            ${deviceOptions}
-          </select>
-        </section>
       </section>
     `;
 
     root.querySelector('[data-enabled-toggle]')?.addEventListener('change', () => {
       toggleEnabled();
-    });
-    root.querySelector('[data-microphone-select]')?.addEventListener('change', (event) => {
-      selectInputDevice(event.target.value ?? '');
     });
   }
 
