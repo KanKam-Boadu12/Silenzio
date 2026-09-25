@@ -29,6 +29,67 @@ export const ENGINE_STAGE_COUNT = 2;
 export const DTLN_LAYER_COUNT = ENGINE_STAGE_COUNT;
 const GRAPH_PROCESSING_TIMEOUT_MS = 8000;
 const HIGHPASS_HZ = 80;
+const ECHO_WORKLET_NAME = 'echo-cancel-processor';
+const ECHO_WORKLET_SOURCE = `
+class EchoCancelProcessor extends AudioWorkletProcessor {
+  constructor() {
+    super();
+    this.length = 2048;
+    this.weights = new Float32Array(this.length);
+    this.history = new Float32Array(this.length);
+    this.mu = 0.12;
+    this.farEnergy = 0.0001;
+    this.nearEnergy = 0.0001;
+  }
+
+  process(inputs, outputs) {
+    const near = inputs[0] && inputs[0][0];
+    const far = inputs[1] && inputs[1][0];
+    const output = outputs[0] && outputs[0][0];
+    if (!near || !output) return true;
+    if (!far) {
+      output.set(near);
+      return true;
+    }
+
+    for (let index = 0; index < near.length; index += 1) {
+      this.history.copyWithin(0, 1);
+      this.history[this.length - 1] = far[index] || 0;
+
+      let predicted = 0;
+      let power = 0.0001;
+      for (let tap = 0; tap < this.length; tap += 1) {
+        const sample = this.history[tap];
+        predicted += this.weights[tap] * sample;
+        power += sample * sample;
+      }
+
+      const error = near[index] - predicted;
+      const farPower = (far[index] || 0) * (far[index] || 0);
+      const nearPower = near[index] * near[index];
+      this.farEnergy = 0.97 * this.farEnergy + 0.03 * farPower;
+      this.nearEnergy = 0.97 * this.nearEnergy + 0.03 * nearPower;
+
+      const farActive = this.farEnergy > 0.000001;
+      const doubletalk = farActive && this.nearEnergy > this.farEnergy * 1.5;
+      if (farActive && !doubletalk) {
+        const gain = (this.mu * error) / power;
+        for (let tap = 0; tap < this.length; tap += 1) {
+          this.weights[tap] += gain * this.history[tap];
+        }
+      }
+
+      let cleaned = error;
+      if (farActive && !doubletalk && predicted * predicted > error * error * 4) {
+        cleaned *= 0.2;
+      }
+      output[index] = cleaned;
+    }
+    return true;
+  }
+}
+registerProcessor('${ECHO_WORKLET_NAME}', EchoCancelProcessor);
+`;
 
 export class AudioPipeline {
   constructor({ assetBaseUrl = '/', direction = 'outgoing', onEvent, layers: _layers = DTLN_LAYER_COUNT } = {}) {
@@ -43,6 +104,51 @@ export class AudioPipeline {
     this.graphs = new Map();
     this.mediaSources = new WeakMap();
     this.mediaKeys = new WeakMap();
+    this.echoNodes = new Set();
+    this.echoReference = null;
+    this.echoWorkletReady = null;
+  }
+
+  setEchoReference(stream) {
+    if (this.direction !== 'outgoing') {
+      return;
+    }
+    this.echoReference = stream instanceof MediaStream ? stream : null;
+    this.echoNodes.forEach((node) => this.connectEchoReference(node));
+  }
+
+  async ensureEchoWorklet(context) {
+    if (!this.echoWorkletReady) {
+      const url = URL.createObjectURL(new Blob([ECHO_WORKLET_SOURCE], { type: 'text/javascript' }));
+      this.echoWorkletReady = context.audioWorklet.addModule(url).finally(() => URL.revokeObjectURL(url));
+    }
+    await this.echoWorkletReady;
+    const node = new AudioWorkletNode(context, ECHO_WORKLET_NAME, {
+      numberOfInputs: 2,
+      numberOfOutputs: 1,
+      outputChannelCount: [1],
+      channelCount: 1,
+      channelCountMode: 'explicit',
+    });
+    this.echoNodes.add(node);
+    this.connectEchoReference(node);
+    return node;
+  }
+
+  connectEchoReference(node) {
+    try {
+      node.echoReferenceSource?.disconnect();
+    } catch (_error) {
+      // Already disconnected.
+    }
+    node.echoReferenceSource = null;
+    const track = this.echoReference?.getAudioTracks?.().find((item) => item.readyState === 'live');
+    if (!track) {
+      return;
+    }
+    const source = node.context.createMediaStreamSource(new MediaStream([track]));
+    source.connect(node, 0, 1);
+    node.echoReferenceSource = source;
   }
 
   emit(type, extra = {}) {
@@ -254,6 +360,9 @@ export class AudioPipeline {
     const chain = await this.createProcessorChain(context);
     const source = context.createMediaStreamSource(graphStream);
     const destination = context.createMediaStreamDestination();
+    if (this.direction === 'outgoing') {
+      chain.processors.push(await this.ensureEchoWorklet(context));
+    }
 
     this.wireGraph(source, chain.highpass, chain.processors, destination);
 

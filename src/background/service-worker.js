@@ -53,7 +53,7 @@ function logDuplex(state, tabId) {
 const initialState = {
   enabled: true,
   txEnabled: true,
-  rxEnabled: true,
+  rxEnabled: false,
   status: 'starting',
   txStatus: 'idle',
   rxStatus: 'idle',

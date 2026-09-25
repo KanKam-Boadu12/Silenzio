@@ -16,7 +16,7 @@ if (window[WINDOW_BRIDGE_FLAG]) {
         message: 'extension: bridge already installed',
         enabled: window[WINDOW_STATE_KEY]?.enabled ?? true,
         txEnabled: window[WINDOW_STATE_KEY]?.txEnabled ?? true,
-        rxEnabled: window[WINDOW_STATE_KEY]?.rxEnabled ?? true,
+        rxEnabled: window[WINDOW_STATE_KEY]?.rxEnabled ?? false,
         selectedDeviceId: window[WINDOW_STATE_KEY]?.selectedDeviceId ?? '',
         devices: window[WINDOW_STATE_KEY]?.devices ?? [],
         status: window[WINDOW_STATE_KEY]?.status ?? 'idle',
@@ -41,7 +41,7 @@ if (window[WINDOW_BRIDGE_FLAG]) {
   const state = {
     enabled: false,
     txEnabled: true,
-    rxEnabled: true,
+    rxEnabled: false,
     selectedDeviceId: '',
     devices: [],
     assetBaseUrl: new URL('./', import.meta.url).href,
@@ -70,6 +70,7 @@ if (window[WINDOW_BRIDGE_FLAG]) {
   const remoteTracks = new WeakSet();
   const senderToRawTrackMap = new Map();
   const trackPairMap = new WeakMap();
+  const rawToCleanTrack = new WeakMap();
   const activeMediaElements = new Map();
   const capturedRawTracks = new Set();
   const echoCancellationBefore = new WeakMap();
@@ -329,13 +330,16 @@ if (window[WINDOW_BRIDGE_FLAG]) {
 
       processedTracks.add(processed.cleanTrack);
       localMicTracks.add(processed.cleanTrack);
-      trackPairMap.set(processed.cleanTrack, processed.rawTrack);
+      rawStream.getAudioTracks().forEach((track) => {
+        trackPairMap.set(processed.cleanTrack, track);
+        rawToCleanTrack.set(track, processed.cleanTrack);
+      });
       publish('outgoing: returned DeepFilterNet3 + RNNoise microphone stream', {
         pipeline: 'outgoing',
         type: 'stream-replaced',
         settings: processed.settings,
       });
-      return new MediaStream([processed.cleanTrack, ...rawStream.getVideoTracks()].filter(Boolean));
+      return rawStream;
     } catch (error) {
       state.txStatus = 'inactive';
       state.txProcessing = false;
@@ -399,6 +403,20 @@ if (window[WINDOW_BRIDGE_FLAG]) {
       }
 
       senderToRawTrackMap.set(sender, trackPairMap.get(track) || track);
+      const preparedCleanTrack = rawToCleanTrack.get(track);
+      if (preparedCleanTrack && preparedCleanTrack !== track) {
+        const replace = originals.replaceTrack
+          ? originals.replaceTrack.call(sender, preparedCleanTrack)
+          : sender.replaceTrack(preparedCleanTrack);
+        replace.catch((error) => {
+          publish(`outgoing: ${error.message}`, {
+            pipeline: 'outgoing',
+            type: 'error',
+            reason: error.message,
+          });
+        });
+        return sender;
+      }
       ensureEnabled()
         .then((ready) => {
           if (!ready || !state.txEnabled || state.txStatus !== 'active') {
@@ -570,6 +588,7 @@ if (window[WINDOW_BRIDGE_FLAG]) {
         });
 
         attachPlayback(element, rawStream);
+        txPipeline.setEchoReference(rawStream);
 
         const isCurrentAssignment = () => activeMediaElements.get(element)?.rawStream === rawStream;
 
