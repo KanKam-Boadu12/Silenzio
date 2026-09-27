@@ -133,45 +133,7 @@ export async function createEngineWorklets(context, { assetBaseUrl } = {}) {
 }
 
 export async function selfCheckEngine(assetBaseUrl) {
-  const context = new OfflineAudioContext({
-    numberOfChannels: 1,
-    length: ENGINE_SAMPLE_RATE,
-    sampleRate: ENGINE_SAMPLE_RATE,
-  });
-
-  const { nodes, sizes } = await createEngineWorklets(context, { assetBaseUrl });
-  console.info(`${LOG_PREFIX} engine assets present`, sizes);
-
-  const started = Promise.all(
-    nodes.map(({ node, name }) =>
-      waitForWorkletMessage(
-        node,
-        (data) => data?.type === 'processing-started',
-        SELF_CHECK_TIMEOUT_MS,
-        `${name} loaded but never processed a test frame`,
-      ),
-    ),
-  );
-
-  await Promise.all(nodes.map(({ ready }) => ready));
-
-  const oscillator = context.createOscillator();
-  oscillator.type = 'sine';
-  oscillator.frequency.value = 440;
-  let current = oscillator;
-  nodes.forEach(({ node }) => {
-    current.connect(node);
-    current = node;
-  });
-  current.connect(context.destination);
-  oscillator.start(0);
-
-  await Promise.all([started, context.startRendering()]);
-  nodes.forEach(({ node }) => {
-    node.port.postMessage({ type: 'dispose' });
-    node.disconnect();
-  });
-
-  console.info(`${LOG_PREFIX} self-check passed: DeepFilterNet3 + Jitsi RNNoise at 48 kHz`);
-  return { sampleRate: ENGINE_SAMPLE_RATE, assets: sizes };
+  const inventory = await verifyEngineAssets(assetBaseUrl);
+  console.info(`${LOG_PREFIX} engine assets present`, inventory.sizes);
+  return { sampleRate: ENGINE_SAMPLE_RATE, assets: inventory.sizes };
 }

@@ -52,7 +52,24 @@ export class AudioPipeline {
     });
   }
 
+  async releaseContext() {
+    this.stopGraphs();
+    const context = this.context;
+    this.context = null;
+    this.silentKeepAlive = null;
+    this.echoWorkletReady = null;
+    this.echoNodes = new Set();
+    if (context) {
+      try {
+        await context.close();
+      } catch (_error) {
+        // The context is already closed.
+      }
+    }
+  }
+
   async initialize() {
+    await this.releaseContext();
     this.failure = null;
     this.status = 'starting';
     this.emit('self-check-started');
@@ -411,7 +428,7 @@ export class AudioPipeline {
   }
 
   stop() {
-    this.stopGraphs();
+    void this.releaseContext();
     this.status = 'idle';
     this.failure = null;
   }
