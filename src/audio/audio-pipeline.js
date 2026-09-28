@@ -435,56 +435,113 @@ export class AudioPipeline {
       existing.setBypass?.(false);
       return {
         graphKey: existingKey,
-        processingStarted: Promise.resolve(true),
-        dispose: () => existing.setBypass?.(true),
+        processingStarted: existing.processingStarted ?? Promise.resolve(existing.heard === true),
+        dispose: () => this.disposeGraph(existingKey),
         setBypass: existing.setBypass,
       };
     }
 
-    let source = this.mediaSources.get(element);
-    if (!source) {
-      try {
-        source = context.createMediaElementSource(element);
-      } catch (_error) {
-        const stream = element.srcObject;
-        if (!(stream instanceof MediaStream) || stream.getAudioTracks().length === 0) {
-          throw new Error('Cannot tap incoming media element audio');
-        }
-        source = context.createMediaStreamSource(
-          new MediaStream(stream.getAudioTracks().map((track) => track.clone())),
-        );
-        element.muted = true;
-      }
-      this.mediaSources.set(element, source);
+    const stream = element.srcObject;
+    if (!(stream instanceof MediaStream) || stream.getAudioTracks().length === 0) {
+      throw new Error('Cannot tap incoming media element audio');
     }
 
-    const chain = await this.createProcessorChain(context);
-    const setBypass = (bypass) => {
-      this.wireGraph(source, chain.highpass, chain.processors, context.destination, { bypass });
-    };
-    setBypass(false);
+    const wasMuted = element.muted;
+    const clonedTracks = stream.getAudioTracks().map((track) => track.clone());
+    const source = context.createMediaStreamSource(new MediaStream(clonedTracks));
+    const outputGain = context.createGain();
+    outputGain.gain.value = 0;
+    outputGain.connect(context.destination);
 
+    const chain = await this.createProcessorChain(context);
     const graphKey = `media:${element.tagName}:${Math.random().toString(36).slice(2)}`;
-    this.mediaKeys.set(element, graphKey);
-    this.graphs.set(graphKey, {
+
+    const setBypass = (bypass) => {
+      const graph = this.graphs.get(graphKey);
+      if (!graph) {
+        return;
+      }
+      if (bypass) {
+        graph.outputGain.gain.value = 0;
+        if (this.mediaKeys.get(element) === graphKey) {
+          element.muted = graph.wasMuted;
+        }
+        return;
+      }
+      this.wireGraph(source, chain.highpass, chain.processors, outputGain);
+      if (graph.heard) {
+        element.muted = true;
+        graph.outputGain.gain.value = 1;
+      }
+    };
+
+    const graph = {
       source,
       processors: chain.processors,
       highpass: chain.highpass,
       element,
+      outputGain,
+      wasMuted,
+      clonedTracks,
+      heard: false,
       keepSource: true,
       processingTimer: chain.processingTimer,
       settleProcessingStarted: chain.settleProcessingStarted,
+      processingStarted: null,
       setBypass,
+    };
+    this.mediaKeys.set(element, graphKey);
+    this.graphs.set(graphKey, graph);
+    setBypass(false);
+
+    const processingStarted = chain.processingStarted.then((started) => {
+      if (!started || !this.graphs.has(graphKey)) {
+        return false;
+      }
+      graph.heard = true;
+      if (this.mediaKeys.get(element) === graphKey) {
+        element.muted = true;
+        outputGain.gain.value = 1;
+      }
+      return true;
     });
 
+    graph.processingStarted = processingStarted;
     this.emit('stream-replaced', { layers: this.layerCount, tap: 'media-element' });
 
     return {
       graphKey,
-      processingStarted: chain.processingStarted,
-      dispose: () => setBypass(true),
+      processingStarted,
+      dispose: () => this.disposeGraph(graphKey),
       setBypass,
     };
+  }
+
+  releaseMediaGraph(key, graph) {
+    try {
+      graph.outputGain?.disconnect();
+      graph.source?.disconnect();
+      graph.highpass?.disconnect();
+      const processors = graph.processors ?? [];
+      processors.forEach((processor) => {
+        processor?.port.postMessage({ type: 'dispose' });
+        processor?.disconnect();
+      });
+      graph.clonedTracks?.forEach((track) => {
+        try {
+          track.stop();
+        } catch (_stopErr) {
+          // Ignore clone teardown errors
+        }
+      });
+      if (graph.element && this.mediaKeys.get(graph.element) === key) {
+        graph.element.muted = graph.wasMuted ?? false;
+        this.mediaKeys.delete(graph.element);
+      }
+    } catch (_err) {
+      // Ignore disconnect errors during teardown
+    }
+    this.graphs.delete(key);
   }
 
   disposeGraph(key) {
@@ -497,8 +554,7 @@ export class AudioPipeline {
       clearTimeout(graph.processingTimer);
       graph.settleProcessingStarted?.(false);
       if (graph.keepSource) {
-        graph.setBypass?.(true);
-        this.graphs.delete(key);
+        this.releaseMediaGraph(key, graph);
         return;
       }
       graph.source?.disconnect();

@@ -16,7 +16,7 @@ if (window[WINDOW_BRIDGE_FLAG]) {
         message: 'extension: bridge already installed',
         enabled: window[WINDOW_STATE_KEY]?.enabled ?? true,
         txEnabled: window[WINDOW_STATE_KEY]?.txEnabled ?? true,
-        rxEnabled: window[WINDOW_STATE_KEY]?.rxEnabled ?? false,
+        rxEnabled: window[WINDOW_STATE_KEY]?.rxEnabled ?? true,
         selectedDeviceId: window[WINDOW_STATE_KEY]?.selectedDeviceId ?? '',
         devices: window[WINDOW_STATE_KEY]?.devices ?? [],
         status: window[WINDOW_STATE_KEY]?.status ?? 'idle',
@@ -41,7 +41,7 @@ if (window[WINDOW_BRIDGE_FLAG]) {
   const state = {
     enabled: false,
     txEnabled: true,
-    rxEnabled: false,
+    rxEnabled: true,
     selectedDeviceId: '',
     devices: [],
     assetBaseUrl: new URL('./', import.meta.url).href,
@@ -547,10 +547,11 @@ if (window[WINDOW_BRIDGE_FLAG]) {
     if (!entry) {
       return;
     }
-    entry.setBypass?.(true);
+    const dispose = entry.dispose;
+    entry.setBypass = null;
     entry.dispose = null;
     entry.graphKey = null;
-    entry.setBypass = null;
+    dispose?.();
   }
 
   function patchMediaElementSrcObject() {
@@ -578,29 +579,36 @@ if (window[WINDOW_BRIDGE_FLAG]) {
 
         const rawStream = stream;
         const element = this;
+        const generation = Symbol('incoming-audio');
         disposeMediaEntry(previous);
-        activeMediaElements.set(element, {
+        const entry = {
           rawStream,
+          generation,
           graphKey: null,
           dispose: null,
           setBypass: null,
           processingPromise: null,
-        });
+          pending: true,
+        };
+        activeMediaElements.set(element, entry);
 
         attachPlayback(element, rawStream);
         txPipeline.setEchoReference(rawStream);
 
-        const isCurrentAssignment = () => activeMediaElements.get(element)?.rawStream === rawStream;
+        const isCurrentAssignment = () => activeMediaElements.get(element)?.generation === generation;
 
         ensureEnabled()
           .then((ready) => {
-            if (!isCurrentAssignment() || !ready || !state.rxEnabled || state.rxStatus !== 'active') {
+            if (!isCurrentAssignment()) {
+              return undefined;
+            }
+            if (!ready || !state.rxEnabled || state.rxStatus !== 'active') {
+              entry.pending = false;
               return undefined;
             }
 
-            const entry = activeMediaElements.get(element);
-            if (!entry || entry.processingPromise) {
-              return entry?.processingPromise;
+            if (entry.processingPromise) {
+              return entry.processingPromise;
             }
 
             const processingPromise = rxPipeline
@@ -608,12 +616,12 @@ if (window[WINDOW_BRIDGE_FLAG]) {
               .then(async (processed) => {
                 const started = await processed.processingStarted;
                 if (!isCurrentAssignment() || !state.enabled || !state.rxEnabled) {
-                  processed.setBypass?.(true);
+                  processed.dispose?.();
                   return;
                 }
 
                 if (!started) {
-                  processed.setBypass?.(true);
+                  processed.dispose?.();
                   console.warn(`${LOG_PREFIX} RX engine did not start processing; playing raw media element`);
                   return;
                 }
@@ -629,9 +637,11 @@ if (window[WINDOW_BRIDGE_FLAG]) {
                 console.error(`${LOG_PREFIX} RX processing failed for media element`, error);
               })
               .finally(() => {
-                const current = activeMediaElements.get(element);
-                if (current?.processingPromise === processingPromise) {
-                  current.processingPromise = null;
+                if (activeMediaElements.get(element)?.generation === generation) {
+                  entry.pending = false;
+                  if (entry.processingPromise === processingPromise) {
+                    entry.processingPromise = null;
+                  }
                 }
               });
 
@@ -645,6 +655,22 @@ if (window[WINDOW_BRIDGE_FLAG]) {
     });
   }
 
+  function captureExistingIncomingMedia() {
+    if (!originals.mediaElementSrcObject) {
+      return;
+    }
+
+    document.querySelectorAll('audio, video').forEach((element) => {
+      if (activeMediaElements.has(element)) {
+        return;
+      }
+      const stream = originals.mediaElementSrcObject.get.call(element);
+      if (isIncomingStream(stream)) {
+        element.srcObject = stream;
+      }
+    });
+  }
+
   async function denoiseActiveMediaElements() {
     if (!state.enabled || !state.rxEnabled || state.rxStatus !== 'active') {
       return;
@@ -652,6 +678,9 @@ if (window[WINDOW_BRIDGE_FLAG]) {
 
     for (const [element, entry] of activeMediaElements.entries()) {
       if (!entry?.rawStream?.active) {
+        continue;
+      }
+      if (entry.pending || entry.processingPromise) {
         continue;
       }
       if (typeof entry.setBypass === 'function') {
@@ -771,6 +800,7 @@ if (window[WINDOW_BRIDGE_FLAG]) {
 
         publish('extension: DeepFilterNet3 + Jitsi RNNoise active at 48 kHz');
         await replaceExistingSenders();
+        captureExistingIncomingMedia();
         await denoiseActiveMediaElements();
       } catch (error) {
         state.status = 'inactive';
