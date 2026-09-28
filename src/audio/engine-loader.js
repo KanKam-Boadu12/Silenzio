@@ -6,7 +6,6 @@ export const RNNOISE_PROCESSOR_NAME = 'NoiseSuppressorWorklet';
 export const DFN_SUPPRESSION_LEVEL = 90;
 
 const READY_TIMEOUT_MS = 30000;
-const SELF_CHECK_TIMEOUT_MS = 15000;
 const MIN_ASSET_BYTES = 1024;
 
 function engineUrls(assetBaseUrl) {

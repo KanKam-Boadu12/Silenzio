@@ -70,8 +70,10 @@ if (window[WINDOW_BRIDGE_FLAG]) {
   const remoteTracks = new WeakSet();
   const senderToRawTrackMap = new Map();
   const trackPairMap = new WeakMap();
+  const rawToCleanTrack = new WeakMap();
   const activeMediaElements = new Map();
   const capturedRawTracks = new Set();
+  const echoCancellationBefore = new WeakMap();
 
   let txPipeline = createPipeline('outgoing');
   let rxPipeline = createPipeline('incoming');
@@ -206,12 +208,81 @@ if (window[WINDOW_BRIDGE_FLAG]) {
     return state.devices;
   }
 
+  function rememberEchoCancellation(track, previous) {
+    if (!track || echoCancellationBefore.has(track)) {
+      return;
+    }
+    echoCancellationBefore.set(track, previous);
+  }
+
+  async function enableEchoCancellation(track, previous) {
+    if (track?.kind !== 'audio' || typeof track.applyConstraints !== 'function') {
+      return;
+    }
+
+    rememberEchoCancellation(
+      track,
+      previous !== undefined ? previous : track.getSettings?.().echoCancellation === true,
+    );
+
+    try {
+      await track.applyConstraints({
+        echoCancellation: true,
+        noiseSuppression: false,
+        autoGainControl: false,
+      });
+    } catch (_error) {
+      // Some devices cannot change echo cancellation after the track is open.
+    }
+  }
+
+  async function restoreEchoCancellation(track) {
+    if (!echoCancellationBefore.has(track) || typeof track?.applyConstraints !== 'function') {
+      return;
+    }
+
+    const previous = echoCancellationBefore.get(track);
+    echoCancellationBefore.delete(track);
+
+    try {
+      await track.applyConstraints({ echoCancellation: previous });
+    } catch (_error) {
+      // The track may already have ended.
+    }
+  }
+
+  async function restoreEchoCancellationOnLiveMics() {
+    const tracks = new Set(capturedRawTracks);
+    for (const pc of peerConnections) {
+      for (const sender of pc.getSenders()) {
+        if (sender.track?.kind !== 'audio') {
+          continue;
+        }
+        tracks.add(senderToRawTrackMap.get(sender) || sender.track);
+      }
+    }
+    await Promise.all([...tracks].map((track) => restoreEchoCancellation(track)));
+  }
+
+  async function enableEchoCancellationOnLiveMics() {
+    const tracks = new Set(capturedRawTracks);
+    for (const pc of peerConnections) {
+      for (const sender of pc.getSenders()) {
+        if (sender.track?.kind !== 'audio') {
+          continue;
+        }
+        tracks.add(senderToRawTrackMap.get(sender) || sender.track);
+      }
+    }
+    await Promise.all([...tracks].map((track) => enableEchoCancellation(track)));
+  }
+
   function cleanAudioConstraints(constraints) {
     if (!audioRequested(constraints)) {
       return constraints;
     }
 
-    const nextAudio = mergeCallAudioConstraints(constraints.audio, state.selectedDeviceId);
+    const nextAudio = mergeCallAudioConstraints(constraints.audio, state.selectedDeviceId, state.enabled);
 
     return {
       ...constraints,
@@ -221,7 +292,16 @@ if (window[WINDOW_BRIDGE_FLAG]) {
 
   // --- OUTGOING (TX) INTERCEPTION ---
   async function getCleanUserMedia(constraints) {
+    const pageEchoCancellation =
+      typeof constraints?.audio === 'object' && constraints.audio !== null
+        ? constraints.audio.echoCancellation === true
+        : false;
     const rawStream = await originals.getUserMedia(cleanAudioConstraints(constraints));
+    if (state.enabled) {
+      await Promise.all(
+        rawStream.getAudioTracks().map((track) => enableEchoCancellation(track, pageEchoCancellation)),
+      );
+    }
     rawStream.getAudioTracks().forEach((t) => {
       localMicTracks.add(t);
       capturedRawTracks.add(t);
@@ -250,13 +330,16 @@ if (window[WINDOW_BRIDGE_FLAG]) {
 
       processedTracks.add(processed.cleanTrack);
       localMicTracks.add(processed.cleanTrack);
-      trackPairMap.set(processed.cleanTrack, processed.rawTrack);
+      rawStream.getAudioTracks().forEach((track) => {
+        trackPairMap.set(processed.cleanTrack, track);
+        rawToCleanTrack.set(track, processed.cleanTrack);
+      });
       publish('outgoing: returned DeepFilterNet3 + RNNoise microphone stream', {
         pipeline: 'outgoing',
         type: 'stream-replaced',
         settings: processed.settings,
       });
-      return new MediaStream([processed.cleanTrack, ...rawStream.getVideoTracks()].filter(Boolean));
+      return rawStream;
     } catch (error) {
       state.txStatus = 'inactive';
       state.txProcessing = false;
@@ -320,6 +403,20 @@ if (window[WINDOW_BRIDGE_FLAG]) {
       }
 
       senderToRawTrackMap.set(sender, trackPairMap.get(track) || track);
+      const preparedCleanTrack = rawToCleanTrack.get(track);
+      if (preparedCleanTrack && preparedCleanTrack !== track) {
+        const replace = originals.replaceTrack
+          ? originals.replaceTrack.call(sender, preparedCleanTrack)
+          : sender.replaceTrack(preparedCleanTrack);
+        replace.catch((error) => {
+          publish(`outgoing: ${error.message}`, {
+            pipeline: 'outgoing',
+            type: 'error',
+            reason: error.message,
+          });
+        });
+        return sender;
+      }
       ensureEnabled()
         .then((ready) => {
           if (!ready || !state.txEnabled || state.txStatus !== 'active') {
@@ -450,10 +547,11 @@ if (window[WINDOW_BRIDGE_FLAG]) {
     if (!entry) {
       return;
     }
-    entry.setBypass?.(true);
+    const dispose = entry.dispose;
+    entry.setBypass = null;
     entry.dispose = null;
     entry.graphKey = null;
-    entry.setBypass = null;
+    dispose?.();
   }
 
   function patchMediaElementSrcObject() {
@@ -481,28 +579,36 @@ if (window[WINDOW_BRIDGE_FLAG]) {
 
         const rawStream = stream;
         const element = this;
+        const generation = Symbol('incoming-audio');
         disposeMediaEntry(previous);
-        activeMediaElements.set(element, {
+        const entry = {
           rawStream,
+          generation,
           graphKey: null,
           dispose: null,
           setBypass: null,
           processingPromise: null,
-        });
+          pending: true,
+        };
+        activeMediaElements.set(element, entry);
 
         attachPlayback(element, rawStream);
+        txPipeline.setEchoReference(rawStream);
 
-        const isCurrentAssignment = () => activeMediaElements.get(element)?.rawStream === rawStream;
+        const isCurrentAssignment = () => activeMediaElements.get(element)?.generation === generation;
 
         ensureEnabled()
           .then((ready) => {
-            if (!isCurrentAssignment() || !ready || !state.rxEnabled || state.rxStatus !== 'active') {
+            if (!isCurrentAssignment()) {
+              return undefined;
+            }
+            if (!ready || !state.rxEnabled || state.rxStatus !== 'active') {
+              entry.pending = false;
               return undefined;
             }
 
-            const entry = activeMediaElements.get(element);
-            if (!entry || entry.processingPromise) {
-              return entry?.processingPromise;
+            if (entry.processingPromise) {
+              return entry.processingPromise;
             }
 
             const processingPromise = rxPipeline
@@ -510,12 +616,12 @@ if (window[WINDOW_BRIDGE_FLAG]) {
               .then(async (processed) => {
                 const started = await processed.processingStarted;
                 if (!isCurrentAssignment() || !state.enabled || !state.rxEnabled) {
-                  processed.setBypass?.(true);
+                  processed.dispose?.();
                   return;
                 }
 
                 if (!started) {
-                  processed.setBypass?.(true);
+                  processed.dispose?.();
                   console.warn(`${LOG_PREFIX} RX engine did not start processing; playing raw media element`);
                   return;
                 }
@@ -531,9 +637,11 @@ if (window[WINDOW_BRIDGE_FLAG]) {
                 console.error(`${LOG_PREFIX} RX processing failed for media element`, error);
               })
               .finally(() => {
-                const current = activeMediaElements.get(element);
-                if (current?.processingPromise === processingPromise) {
-                  current.processingPromise = null;
+                if (activeMediaElements.get(element)?.generation === generation) {
+                  entry.pending = false;
+                  if (entry.processingPromise === processingPromise) {
+                    entry.processingPromise = null;
+                  }
                 }
               });
 
@@ -547,6 +655,22 @@ if (window[WINDOW_BRIDGE_FLAG]) {
     });
   }
 
+  function captureExistingIncomingMedia() {
+    if (!originals.mediaElementSrcObject) {
+      return;
+    }
+
+    document.querySelectorAll('audio, video').forEach((element) => {
+      if (activeMediaElements.has(element)) {
+        return;
+      }
+      const stream = originals.mediaElementSrcObject.get.call(element);
+      if (isIncomingStream(stream)) {
+        element.srcObject = stream;
+      }
+    });
+  }
+
   async function denoiseActiveMediaElements() {
     if (!state.enabled || !state.rxEnabled || state.rxStatus !== 'active') {
       return;
@@ -554,6 +678,9 @@ if (window[WINDOW_BRIDGE_FLAG]) {
 
     for (const [element, entry] of activeMediaElements.entries()) {
       if (!entry?.rawStream?.active) {
+        continue;
+      }
+      if (entry.pending || entry.processingPromise) {
         continue;
       }
       if (typeof entry.setBypass === 'function') {
@@ -654,6 +781,7 @@ if (window[WINDOW_BRIDGE_FLAG]) {
       publish('extension: auto-starting DeepFilterNet3 + Jitsi RNNoise at 48 kHz');
 
       try {
+        await enableEchoCancellationOnLiveMics();
         if (state.txEnabled) {
           txPipeline.stopGraphs();
           await txPipeline.initialize();
@@ -672,6 +800,7 @@ if (window[WINDOW_BRIDGE_FLAG]) {
 
         publish('extension: DeepFilterNet3 + Jitsi RNNoise active at 48 kHz');
         await replaceExistingSenders();
+        captureExistingIncomingMedia();
         await denoiseActiveMediaElements();
       } catch (error) {
         state.status = 'inactive';
@@ -701,6 +830,7 @@ if (window[WINDOW_BRIDGE_FLAG]) {
     state.failure = null;
 
     await restoreSenders();
+    await restoreEchoCancellationOnLiveMics();
     restoreMediaElements();
 
     txPipeline.stop();
@@ -766,6 +896,7 @@ if (window[WINDOW_BRIDGE_FLAG]) {
     }
 
     const rawStream = await originals.getUserMedia(cleanAudioConstraints({ audio: true }));
+    await Promise.all(rawStream.getAudioTracks().map((track) => enableEchoCancellation(track, false)));
     rawStream.getAudioTracks().forEach((track) => {
       localMicTracks.add(track);
       capturedRawTracks.add(track);
