@@ -37,6 +37,27 @@ function contentScriptIife() {
           publicDir: false,
           build: {
             emptyOutDir: false,
+            outDir: path.join(root, 'dist'),
+            lib: {
+              entry: path.join(root, 'src/content/page-bridge.js'),
+              name: 'NoiseCancellationPageBridge',
+              formats: ['iife'],
+              fileName: () => 'page-bridge-main.js',
+            },
+            rollupOptions: {
+              output: {
+                inlineDynamicImports: true,
+              },
+            },
+          },
+          logLevel: 'warn',
+        });
+
+        await viteBuild({
+          configFile: false,
+          publicDir: false,
+          build: {
+            emptyOutDir: false,
             outDir: path.join(root, 'dist', 'engine'),
             lib: {
               entry: path.join(root, 'src/audio/rnnoise-worklet.js'),

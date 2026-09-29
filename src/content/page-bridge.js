@@ -38,13 +38,23 @@ if (window[WINDOW_BRIDGE_FLAG]) {
   const FROM_EXTENSION = PageMessageSource.EXTENSION;
   const FROM_PAGE = PageMessageSource.PAGE;
 
+  function extensionAssetBaseUrl() {
+    try {
+      const moduleUrl = import.meta.url;
+      if (moduleUrl) return new URL('./', moduleUrl).href;
+    } catch (_error) {
+      // A classic script build has no module URL. The content script sends the extension URL.
+    }
+    return '';
+  }
+
   const state = {
     enabled: false,
     txEnabled: true,
     rxEnabled: true,
     selectedDeviceId: '',
     devices: [],
-    assetBaseUrl: new URL('./', import.meta.url).href,
+    assetBaseUrl: extensionAssetBaseUrl(),
     installed: false,
     status: 'idle',
     txStatus: 'idle',

@@ -51,7 +51,13 @@ export function createPopup(root) {
 
   async function injectContentScript(tabId) {
     await chrome.scripting.executeScript({
-      target: { tabId },
+      target: { tabId, allFrames: true },
+      files: ['page-bridge-main.js'],
+      world: 'MAIN',
+      injectImmediately: true,
+    });
+    await chrome.scripting.executeScript({
+      target: { tabId, allFrames: true },
       files: ['content-script.js'],
       injectImmediately: true,
     });

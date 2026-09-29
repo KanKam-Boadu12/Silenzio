@@ -67,6 +67,45 @@ const initialState = {
 };
 
 let lastDuplexKey = '';
+const frameStates = new Map();
+
+function frameKey(sender) {
+  return `${sender.tab?.id ?? 'unknown'}:${sender.frameId ?? 0}`;
+}
+
+function stateRank(state) {
+  if (!state?.enabled) return 0;
+  if (state.txProcessing || state.rxProcessing || state.processing) return 5;
+  if (state.status === 'active') return 4;
+  if (state.status === 'starting') return 3;
+  if (state.status === 'inactive' || state.status === 'failed' || state.failure) return 2;
+  return 1;
+}
+
+function bestStateForTab(tabId) {
+  const prefix = `${tabId}:`;
+  let best = null;
+  for (const [key, state] of frameStates) {
+    if (!key.startsWith(prefix)) continue;
+    if (!best || stateRank(state) > stateRank(best)) best = state;
+  }
+  return best;
+}
+
+function clearTabFrames(tabId) {
+  const prefix = `${tabId}:`;
+  for (const key of frameStates.keys()) {
+    if (key.startsWith(prefix)) frameStates.delete(key);
+  }
+}
+
+chrome.tabs.onRemoved.addListener((tabId) => {
+  clearTabFrames(tabId);
+});
+
+chrome.tabs.onUpdated.addListener((tabId, info) => {
+  if (info.status === 'loading') clearTabFrames(tabId);
+});
 
 chrome.runtime.onInstalled.addListener(() => {
   chrome.storage.session.set({ [STORAGE_KEY]: initialState });
@@ -105,8 +144,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   chrome.storage.session.get(STORAGE_KEY).then((result) => {
     const current = result[STORAGE_KEY] ?? initialState;
-    const updated = {
-      ...current,
+    frameStates.set(frameKey(sender), {
       enabled: incoming.enabled ?? current.enabled,
       txEnabled: incoming.txEnabled ?? current.txEnabled,
       rxEnabled: incoming.rxEnabled ?? current.rxEnabled,
@@ -119,8 +157,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       txProcessing: incoming.txProcessing ?? current.txProcessing,
       rxProcessing: incoming.rxProcessing ?? current.rxProcessing,
       failure: Object.hasOwn(incoming, 'failure') ? incoming.failure : current.failure,
+      duplex: incoming.duplex,
+    });
+    const preferred = bestStateForTab(tabId) ?? incoming;
+    const updated = {
+      ...current,
+      ...preferred,
+      devices: preferred.devices ?? current.devices ?? [],
     };
-    updated.duplex = incoming.duplex ?? duplexStatus(updated);
+    updated.duplex = preferred.duplex ?? duplexStatus(updated);
 
     const duplexKey = `${tabId}:${updated.duplex}:${updated.txProcessing}:${updated.rxProcessing}:${updated.txStatus}:${updated.rxStatus}`;
     if (duplexKey !== lastDuplexKey) {
