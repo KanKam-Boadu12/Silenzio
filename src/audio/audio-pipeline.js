@@ -28,6 +28,7 @@ export function createLiveAudioContext({ playback: _playback = false } = {}) {
 export const ENGINE_STAGE_COUNT = 2;
 export const DTLN_LAYER_COUNT = ENGINE_STAGE_COUNT;
 const GRAPH_PROCESSING_TIMEOUT_MS = 8000;
+const OUTPUT_FADE_IN_SECONDS = 0.15;
 const HIGHPASS_HZ = 80;
 const ECHO_WORKLET_NAME = 'echo-cancel-processor';
 const ECHO_WORKLET_SOURCE = `
@@ -36,10 +37,14 @@ class EchoCancelProcessor extends AudioWorkletProcessor {
     super();
     this.length = 2048;
     this.weights = new Float32Array(this.length);
-    this.history = new Float32Array(this.length);
+    this.history = new Float32Array(this.length * 2);
+    this.position = 0;
+    this.power = 0.0001;
     this.mu = 0.12;
     this.farEnergy = 0.0001;
     this.nearEnergy = 0.0001;
+    this.duck = 1;
+    this.samples = 0;
   }
 
   process(inputs, outputs) {
@@ -52,38 +57,53 @@ class EchoCancelProcessor extends AudioWorkletProcessor {
       return true;
     }
 
+    const length = this.length;
+    const weights = this.weights;
+    const history = this.history;
+
     for (let index = 0; index < near.length; index += 1) {
-      this.history.copyWithin(0, 1);
-      this.history[this.length - 1] = far[index] || 0;
+      const farSample = far[index] || 0;
+      const oldest = history[this.position];
+      this.power += farSample * farSample - oldest * oldest;
+      history[this.position] = farSample;
+      history[this.position + length] = farSample;
+      const base = this.position + 1;
+      this.position = this.position + 1 === length ? 0 : this.position + 1;
+
+      this.samples += 1;
+      if (this.samples >= 8192) {
+        this.samples = 0;
+        let exact = 0;
+        for (let tap = 0; tap < length; tap += 1) {
+          exact += history[tap] * history[tap];
+        }
+        this.power = exact;
+      }
+      const power = Math.max(this.power, 0) + 0.0001;
 
       let predicted = 0;
-      let power = 0.0001;
-      for (let tap = 0; tap < this.length; tap += 1) {
-        const sample = this.history[tap];
-        predicted += this.weights[tap] * sample;
-        power += sample * sample;
+      for (let tap = 0; tap < length; tap += 1) {
+        predicted += weights[tap] * history[base + tap];
       }
 
       const error = near[index] - predicted;
-      const farPower = (far[index] || 0) * (far[index] || 0);
       const nearPower = near[index] * near[index];
-      this.farEnergy = 0.97 * this.farEnergy + 0.03 * farPower;
+      this.farEnergy = 0.97 * this.farEnergy + 0.03 * farSample * farSample;
       this.nearEnergy = 0.97 * this.nearEnergy + 0.03 * nearPower;
 
       const farActive = this.farEnergy > 0.000001;
       const doubletalk = farActive && this.nearEnergy > this.farEnergy * 1.5;
       if (farActive && !doubletalk) {
         const gain = (this.mu * error) / power;
-        for (let tap = 0; tap < this.length; tap += 1) {
-          this.weights[tap] += gain * this.history[tap];
+        for (let tap = 0; tap < length; tap += 1) {
+          weights[tap] += gain * history[base + tap];
         }
       }
 
-      let cleaned = error;
-      if (farActive && !doubletalk && predicted * predicted > error * error * 4) {
-        cleaned *= 0.2;
-      }
-      output[index] = cleaned;
+      const suppress = farActive && !doubletalk && predicted * predicted > error * error * 4;
+      const target = suppress ? 0.2 : 1;
+      this.duck += (target - this.duck) * (target < this.duck ? 0.005 : 0.0008);
+      output[index] = error * this.duck;
     }
     return true;
   }
@@ -377,11 +397,16 @@ export class AudioPipeline {
     const chain = await this.createProcessorChain(context);
     const source = context.createMediaStreamSource(graphStream);
     const destination = context.createMediaStreamDestination();
+    const outputGain = context.createGain();
+    const fadeStart = context.currentTime;
+    outputGain.gain.setValueAtTime(0, fadeStart);
+    outputGain.gain.linearRampToValueAtTime(1, fadeStart + OUTPUT_FADE_IN_SECONDS);
+    outputGain.connect(destination);
     if (this.direction === 'outgoing') {
       chain.processors.push(await this.ensureEchoWorklet(context));
     }
 
-    this.wireGraph(source, chain.highpass, chain.processors, destination);
+    this.wireGraph(source, chain.highpass, chain.processors, outputGain);
 
     const cleanTrack = destination.stream.getAudioTracks()[0];
 
@@ -403,6 +428,7 @@ export class AudioPipeline {
       processors: chain.processors,
       highpass: chain.highpass,
       destination,
+      outputGain,
       clonedTracks,
       processingTimer: chain.processingTimer,
       settleProcessingStarted: chain.settleProcessingStarted,
@@ -488,7 +514,10 @@ export class AudioPipeline {
       this.wireGraph(source, chain.highpass, chain.processors, outputGain);
       if (graph.heard) {
         element.muted = true;
-        graph.outputGain.gain.value = 1;
+        const now = graph.outputGain.context.currentTime;
+        graph.outputGain.gain.cancelScheduledValues(now);
+        graph.outputGain.gain.setValueAtTime(0, now);
+        graph.outputGain.gain.linearRampToValueAtTime(1, now + OUTPUT_FADE_IN_SECONDS);
       }
     };
 
@@ -518,7 +547,10 @@ export class AudioPipeline {
       graph.heard = true;
       if (this.mediaKeys.get(element) === graphKey) {
         element.muted = true;
-        outputGain.gain.value = 1;
+        const now = outputGain.context.currentTime;
+        outputGain.gain.cancelScheduledValues(now);
+        outputGain.gain.setValueAtTime(0, now);
+        outputGain.gain.linearRampToValueAtTime(1, now + OUTPUT_FADE_IN_SECONDS);
       }
       return true;
     });
@@ -576,6 +608,7 @@ export class AudioPipeline {
       }
       graph.source?.disconnect();
       graph.highpass?.disconnect();
+      graph.outputGain?.disconnect();
       graph.keepAlive?.disconnect();
       const processors = graph.processors ?? (graph.processor ? [graph.processor] : []);
       processors.forEach((processor) => {

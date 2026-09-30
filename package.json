@@ -9,7 +9,7 @@
     "copy-assets": "npm run copy-dtln && npm run copy-engine",
     "dev": "npm run copy-assets && vite build --watch",
     "build": "npm run copy-assets && vite build",
-    "test": "node --test src/audio/call-audio-constraints.test.js",
+    "test": "node --test src/audio/call-audio-constraints.test.js src/audio/vad-gate.test.js",
     "lint": "eslint .",
     "format": "prettier --write ."
   },

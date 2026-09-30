@@ -1,4 +1,5 @@
 import { createRNNWasmModuleSync } from '@jitsi/rnnoise-wasm';
+import { VadGate } from './vad-gate.js';
 
 const RNNOISE_SAMPLE_LENGTH = 480;
 const PROC_QUANTUM = 128;
@@ -26,6 +27,7 @@ class NoiseSuppressorWorklet extends AudioWorkletProcessor {
     this._denoisedBufferLength = 0;
     this._denoisedBufferIndx = 0;
     this._processingStartedReported = false;
+    this._gate = new VadGate();
     this.port.postMessage({ type: 'ready' });
     this.port.onmessage = (event) => {
       if (event.data?.type === 'dispose') {
@@ -61,10 +63,15 @@ class NoiseSuppressorWorklet extends AudioWorkletProcessor {
       for (let i = 0; i < RNNOISE_SAMPLE_LENGTH; i += 1) {
         this._wasm.HEAPF32[this._pcmIndex + i] = frame[i] * SHIFT_16;
       }
-      this._wasm._rnnoise_process_frame(this._context, this._pcmInput, this._pcmInput);
+      const voiceProbability = this._wasm._rnnoise_process_frame(
+        this._context,
+        this._pcmInput,
+        this._pcmInput,
+      );
       for (let i = 0; i < RNNOISE_SAMPLE_LENGTH; i += 1) {
         frame[i] = this._wasm.HEAPF32[this._pcmIndex + i] / SHIFT_16;
       }
+      this._gate.apply(frame, voiceProbability);
       if (!this._processingStartedReported) {
         this._processingStartedReported = true;
         this.port.postMessage({ type: 'processing-started', processedQuanta: 1 });
@@ -81,6 +88,8 @@ class NoiseSuppressorWorklet extends AudioWorkletProcessor {
         this._circularBuffer.subarray(this._denoisedBufferIndx, this._denoisedBufferIndx + outData.length),
       );
       this._denoisedBufferIndx += outData.length;
+    } else {
+      outData.fill(0);
     }
 
     if (this._denoisedBufferIndx === this._circularBufferLength) {

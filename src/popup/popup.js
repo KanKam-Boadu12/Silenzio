@@ -39,6 +39,9 @@ export function createPopup(root) {
     rxStatus: 'idle',
   };
   let pollTimer = 0;
+  let requestedEnabled = null;
+  let requestedAt = 0;
+  const REQUEST_SETTLE_MS = 10000;
 
   async function getActiveTab() {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
@@ -90,6 +93,15 @@ export function createPopup(root) {
   }
 
   function applyStored(stored = {}) {
+    if (requestedEnabled !== null) {
+      const settled =
+        stored.enabled === requestedEnabled || Date.now() - requestedAt > REQUEST_SETTLE_MS;
+      if (!settled) {
+        return;
+      }
+      requestedEnabled = null;
+    }
+
     state = {
       ...state,
       enabled: stored.enabled ?? state.enabled,
@@ -106,6 +118,10 @@ export function createPopup(root) {
 
   async function refresh() {
     const storedState = await chrome.storage.session.get(STORAGE_KEY);
+    if (!storedState[STORAGE_KEY] && requestedEnabled === null) {
+      const preference = await chrome.storage.local.get(USER_ENABLED_STORAGE_KEY);
+      state = { ...state, enabled: preference[USER_ENABLED_STORAGE_KEY] !== false };
+    }
     applyStored(storedState[STORAGE_KEY] ?? {});
 
     try {
@@ -124,6 +140,8 @@ export function createPopup(root) {
 
   async function toggleEnabled() {
     const nextEnabled = !state.enabled;
+    requestedEnabled = nextEnabled;
+    requestedAt = Date.now();
     state = {
       ...state,
       enabled: nextEnabled,
@@ -144,6 +162,7 @@ export function createPopup(root) {
       state = { ...state, connectionError: null };
     } catch (error) {
       console.warn(LOG_PREFIX, error.message);
+      requestedEnabled = null;
       state = { ...state, connectionError: error.message };
     }
 

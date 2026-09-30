@@ -50,6 +50,19 @@ worklet = worklet.replace(
                 }`,
 );
 worklet = worklet.replace(
+  `const outputAvailable = this.getOutputAvailable();
+            if (outputAvailable >= 128) {`,
+  `const outputAvailable = this.getOutputAvailable();
+            if (outputAvailable < 128) {
+                for (let inputNum = 0; inputNum < sourceLimit; inputNum++) {
+                    const output = outputList[inputNum];
+                    for (let channelNum = 0; channelNum < output.length; channelNum++) {
+                        output[channelNum].fill(0);
+                    }
+                }
+            } else if (outputAvailable >= 128) {`,
+);
+worklet = worklet.replace(
   `console.error('Failed to initialize DeepFilter in AudioWorklet:', error);`,
   `console.error('Failed to initialize DeepFilter in AudioWorklet:', error);
                 this.port.postMessage({ type: 'error', message: String(error && error.message || error) });`,

@@ -752,6 +752,7 @@ if (window[WINDOW_BRIDGE_FLAG]) {
   }
 
   let enablePromise = null;
+  let lifecycle = 0;
 
   async function ensureEnabled() {
     if (!state.enabled) {
@@ -780,6 +781,9 @@ if (window[WINDOW_BRIDGE_FLAG]) {
       return enablePromise;
     }
 
+    const generation = (lifecycle += 1);
+    const superseded = () => generation !== lifecycle || !state.enabled;
+
     enablePromise = (async () => {
       installPatches();
       state.enabled = true;
@@ -791,13 +795,16 @@ if (window[WINDOW_BRIDGE_FLAG]) {
       publish('extension: auto-starting DeepFilterNet3 + Jitsi RNNoise at 48 kHz');
 
       try {
-        await enableEchoCancellationOnLiveMics();
         if (state.txEnabled) {
           txPipeline.stopGraphs();
           await txPipeline.initialize();
         }
-        if (state.rxEnabled) {
+        if (state.rxEnabled && !superseded()) {
           await rxPipeline.initialize();
+        }
+
+        if (superseded()) {
+          return;
         }
 
         if (state.txEnabled) {
@@ -810,9 +817,16 @@ if (window[WINDOW_BRIDGE_FLAG]) {
 
         publish('extension: DeepFilterNet3 + Jitsi RNNoise active at 48 kHz');
         await replaceExistingSenders();
+        if (superseded()) {
+          return;
+        }
+        await enableEchoCancellationOnLiveMics();
         captureExistingIncomingMedia();
         await denoiseActiveMediaElements();
       } catch (error) {
+        if (superseded()) {
+          return;
+        }
         state.status = 'inactive';
         state.processing = false;
         state.failure = error.message;
@@ -822,7 +836,9 @@ if (window[WINDOW_BRIDGE_FLAG]) {
           reason: error.message,
         });
       } finally {
-        enablePromise = null;
+        if (generation === lifecycle) {
+          enablePromise = null;
+        }
       }
     })();
 
@@ -830,6 +846,7 @@ if (window[WINDOW_BRIDGE_FLAG]) {
   }
 
   async function disable() {
+    lifecycle += 1;
     state.enabled = false;
     state.status = 'idle';
     state.txStatus = 'idle';
